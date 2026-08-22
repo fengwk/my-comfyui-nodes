@@ -100,6 +100,8 @@ my-comfyui-nodes/
 它依赖 comfy-kitchen 的 `sol_attn` 内核（Kijai `sol_attn` 分支），缺失时 registry
 只跳过注册并在日志告警，不影响其余节点。
 
+背景、协作原理、编译与回滚记录见 [`docs/SOL_ATTN.md`](docs/SOL_ATTN.md)。
+
 ## 测试
 
 ```bash
