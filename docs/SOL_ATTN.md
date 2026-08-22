@@ -101,11 +101,10 @@ COMFY_CUDA_ARCHS="80-real;86-real;89-real" \
 
 ## 安装与切换
 
-备份目录：`/home/fengwk/sol_attn_backup/`，内含：
+自编 wheel 有**两份持久副本**：
 
-- `comfy_kitchen-*.whl`：本地编译的 sol_attn wheel（持久化于此，可反复安装）；
-- `comfy_kitchen_pypi/`：替换前的 PyPI 0.2.31 原目录；
-- 两个脚本：
+- 本仓库 `wheels/comfy_kitchen-0.2.31-cp312-abi3-linux_x86_64.whl`（随 git 分发）；
+- `/home/fengwk/sol_attn_backup/`（本机备份目录，含 PyPI 原目录与切换脚本）。
 
 ```bash
 bash /home/fengwk/sol_attn_backup/install_solattn.sh   # 装 sol_attn wheel
@@ -123,6 +122,30 @@ hasattr(ck, "sol_attn")              # True
 hasattr(ck, "int8_attention")        # True
 ck.int8_attention_is_available()     # True
 ```
+
+## 升级 ComfyUI 后恢复（重点）
+
+升级方式默认是 `uv pip install -r requirements.txt`，这会把 comfy-kitchen 换回官方
+PyPI 包（**sol_attn 丢失**），且本仓库 `uv.lock` 为空，任何 `uv sync` 都可能清掉整个
+venv 的手工包。恢复步骤：
+
+```bash
+# 1. 验证 sol_attn 是否丢失
+/home/fengwk/prog/ComfyUI/.venv/bin/python -c \
+  "import comfy_kitchen as ck; print(hasattr(ck, 'sol_attn'))"
+
+# 2. 若为 False，用仓库里或本机备份的 wheel 重装
+bash /home/fengwk/sol_attn_backup/install_solattn.sh
+# 或直接指定仓库 wheel：
+/home/fengwk/prog/ComfyUI/.venv/bin/pip install --force-reinstall --no-deps \
+  /home/fengwk/comfyui_data/custom_nodes/my-comfyui-nodes/wheels/comfy_kitchen-0.2.31-cp312-abi3-linux_x86_64.whl
+
+# 3. 重启 ComfyUI，再跑一次探针确认
+```
+
+> 注意：自编 wheel 的版本号保持 0.2.31，与 `requirements.txt` 的 pin 一致，所以
+> 正常 `uv pip install -r` 不会覆盖它；只有官方发布新版本号、`requirements.txt` 跟着
+> 升级时才会被替换。届时按上面步骤恢复即可。
 
 ## 首次测试配置
 
