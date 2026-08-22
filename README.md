@@ -12,6 +12,9 @@ git clone https://github.com/fengwk/my-comfyui-nodes.git
 
 依赖：`numpy`、`Pillow`（Comfy 环境一般已有）。
 
+可选：`vendor/sol_attn_minimax_v2.py` 需要 comfy-kitchen 的 `sol_attn` 内核
+（Kijai `sol_attn` 分支构建，官方 PyPI 包不含）。缺失时该节点不注册，其余节点不受影响。
+
 ## 输入约定：用 IMAGE 批次，不要图片列表
 
 Comfy 的视频帧标准类型是 `IMAGE`：形状 `[N, H, W, C]`、float32、`[0, 1]`。
@@ -47,6 +50,30 @@ LoadVideo
 
 输出仍是 `IMAGE`。色块网格固定 `36×64`（576×1024 时为 16×16 像素块），与原脚本一致。
 
+### Patch Sol-Attn (MiniMax)
+
+第三方节点，代码在 `my_nodes/vendor/`。在 MiniMax-H3 上安装 block-sparse
+attention（Sol-Attn），长序列（≥ ~12k tokens）提速；不满足条件的调用
+（短序列 / 非 bf16 / 非 128 head_dim / cross-attention 等）自动回落到
+ModelAttentionBackend 已有的 attention。
+
+| 输入 | 类型 | 默认 | 含义 |
+|---|---|---|---|
+| `model` | MODEL | — | H3 模型 |
+| `tau` | FLOAT | 1.3 | 路由阈值，越高越稀疏（1.0≈16% blocks 精确，1.5≈7%，2.0≈2.7%） |
+| `start_percent` | FLOAT | 0.2 | 该采样阶段之前保持 dense |
+| `end_percent` | FLOAT | 0.9 | 该采样阶段之后保持 dense |
+| `min_tokens` | INT | 12288 | 序列短于此值不走稀疏 |
+| `sink_conditioning` | COMBO | `exact_kv_and_rows` | 条件行保持精确（exact_kv / exact_kv_and_rows / off） |
+| `morton` | BOOLEAN | false | 视频 token 重排成 Morton 顺序 |
+| `morton_curve` | COMBO | `2d_frame` | Morton 曲线（3d / 2d_frame） |
+| `centroid_tail` | BOOLEAN | true | 每个 query block 用质心做 pooled branch（关闭做质量 A/B） |
+| `routed_cap_percent` | INT | 0 | 路由块列表上限百分比，0=不限 |
+| `reuse_qkv_memory` | BOOLEAN | false | 复用 fused qkv buffer 写输出，省约 1.2 GB @80k tokens |
+| `verbose` | BOOLEAN | false | 详细日志 |
+| `tau_profile` | STRING | 空 | 逐 block tau，如 `39-42=0.9` |
+| `dense_blocks` | STRING | 空 | 保持 dense 的 block，如 `0-2,-1` |
+
 ## 加新节点
 
 1. 无 Comfy 依赖的算法放 `my_nodes/core/<name>.py`。
@@ -60,9 +87,18 @@ my-comfyui-nodes/
 ├── my_nodes/
 │   ├── registry.py             # 唯一登记处
 │   ├── core/                   # 纯函数，可单测
-│   └── nodes/                  # 一个文件一个节点
+│   ├── nodes/                  # 一个文件一个节点
+│   └── vendor/                 # 第三方节点，字节级保留原文件
 └── tests/
 ```
+
+## 第三方 vendor 节点
+
+`my_nodes/vendor/sol_attn_minimax_v2.py` 原样转存自
+[t8star/Sol-Attn-v2-wheels](https://huggingface.co/t8star/Sol-Attn-v2-wheels)
+（节点 `Patch Sol-Attn (MiniMax)`）。文件不做任何修改，更新时直接重新下载覆盖；
+它依赖 comfy-kitchen 的 `sol_attn` 内核（Kijai `sol_attn` 分支），缺失时 registry
+只跳过注册并在日志告警，不影响其余节点。
 
 ## 测试
 
