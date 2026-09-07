@@ -7,26 +7,11 @@ Add a new node by:
 
 from __future__ import annotations
 
-import logging
-
 from my_nodes.nodes.inject_tail_chroma_noise import InjectTailChromaNoise
 
 NODE_CLASSES = (
     InjectTailChromaNoise,
 )
-
-# Third-party Sol-Attn node (Kijai / t8star), vendored verbatim from
-# https://huggingface.co/t8star/Sol-Attn-v2-wheels. It imports comfy_kitchen
-# and comfy_api at module scope, so import it lazily here: unit tests run
-# outside ComfyUI, where comfy_api does not exist.
-try:
-    from my_nodes.vendor.sol_attn_minimax_v2 import SolAttnMiniMax
-except ImportError as exc:
-    logging.warning("SolAttnMiniMax not registered (missing dependency): %s", exc)
-    SolAttnMiniMax = None
-
-if SolAttnMiniMax is not None:
-    NODE_CLASSES = NODE_CLASSES + (SolAttnMiniMax,)
 
 
 def _node_id(cls):
