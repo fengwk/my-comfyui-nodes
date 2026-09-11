@@ -50,6 +50,19 @@ LoadVideo
 
 输出仍是 `IMAGE`。色块网格固定 `36×64`（576×1024 时为 16×16 像素块），与原脚本一致。
 
+### My SelfLift Progressive Sampler (MiniMax H3)
+
+基于 `facok/comfyui-SelfLift` 的 MiniMax H3 渐进分辨率采样节点，复制自
+`3534184`。节点 ID 为 `MySelfLiftH3Sampler`，不会覆盖原插件的
+`SelfLiftH3Sampler`；已有工作流需要手动替换为本节点。
+
+本地改动：3D latent upscaler 完成分辨率跃迁后，立即通过 ComfyUI 模型管理器
+从活跃 GPU 模型集合卸载。正常 Dynamic VRAM 模式下，
+`minimax_h3_latent_upscaler_3d_fp32.pth` 的约 1.29 GiB 权重会回到 CPU，
+再进入 MiniMax H3 高分辨率去噪；发生放大异常时也执行清理。放大结果和采样数学
+不变，后续任务再次使用该放大器时会重新载入权重。`--highvram` / `--gpu-only`
+模式的 offload device 仍可能是 GPU，此时不会获得同等显存回收。
+
 ### Patch Sol-Attn (MiniMax)
 
 第三方节点，代码在 `my_nodes/vendor/`。在 MiniMax-H3 上安装 block-sparse

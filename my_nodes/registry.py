@@ -28,6 +28,15 @@ except ImportError as exc:
 if SolAttnMiniMax is not None:
     NODE_CLASSES = NODE_CLASSES + (SolAttnMiniMax,)
 
+try:
+    from my_nodes.nodes.selflift import SelfLiftH3Sampler
+except ImportError as exc:
+    logging.warning("SelfLiftH3Sampler not registered (ComfyUI unavailable): %s", exc)
+    SelfLiftH3Sampler = None
+
+if SelfLiftH3Sampler is not None:
+    NODE_CLASSES = NODE_CLASSES + (SelfLiftH3Sampler,)
+
 
 def _node_id(cls):
     if hasattr(cls, "NODE_ID"):
