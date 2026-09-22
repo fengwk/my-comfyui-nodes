@@ -17,11 +17,20 @@ from my_nodes.core.video_enhance.dlss_stage import (
     resolve_runtime_dir,
     run_dlss_stage,
 )
-from my_nodes.core.video_enhance.gimm_vfi import interpolate_offline
+from my_nodes.core.video_enhance.frame_pipeline import (
+    DlssStageOptions,
+    FrameSpec,
+    VfiStageOptions,
+    pipeline_specs,
+    pipeline_step_total,
+    run_frame_pipeline,
+)
 from my_nodes.core.video_enhance.motion import MOTION_MODES, MOTION_OPTICAL_FLOW
 from my_nodes.core.video_enhance.nr_profiles import neural_rendering_settings
 from my_nodes.core.video_enhance.plan import (
     NR_PROFILES,
+    STAGE_ORDER_DLSS_THEN_VFI,
+    STAGE_ORDERS,
     VideoEnhancePlan,
 )
 
@@ -42,14 +51,29 @@ _SCALE_BY_LABEL = dict(SPATIAL_MODES)
 CHANNEL_ORDERS = ("auto", "RGBA", "BGRA")
 VFI_PRECISIONS = ("fp32", "fp16", "bf16")
 
+# The final IMAGE batch has to be RAM-resident, so refuse one that would claim
+# more than this share of the RAM that is available right now.
+OUTPUT_RAM_FRACTION = 0.8
+
+STAGE_ORDER_TOOLTIP = (
+    "Order of the two stages when both are enabled: dlss_then_vfi is the legacy "
+    "default, vfi_then_dlss interpolates first and enhances the interpolated frames."
+)
+
 DESCRIPTION = (
     "DLSS feature 1 (DLAA at 1.0, or super resolution above it), then optional "
     "feature 18 neural rendering in the same worker, then optional offline "
-    "GIMM-VFI 2x after that worker exits. Disabled stages are not touched. "
+    "GIMM-VFI 2x after that worker exits; stage_order can interpolate first and "
+    "enhance the interpolated frames instead. Disabled stages are not touched. "
+    "A two-stage run stages the intermediate frames on disk, not in RAM. "
     "1.0 is native DLAA, not an upscale. Neural-rendering profiles are local "
     "UX presets, not NVIDIA official presets. Frame interpolation is offline "
     "GIMM-VFI, not DLSS Frame Generation."
 )
+
+
+class InsufficientRamError(RuntimeError):
+    """The final IMAGE batch cannot be allocated without exhausting RAM."""
 
 
 def spatial_scale(label: str) -> float:
@@ -61,7 +85,15 @@ def spatial_scale(label: str) -> float:
         ) from None
 
 
-def _plan(enable_sr: bool, spatial_mode: str, enable_nr: bool, nr_profile: str, nr_intensity: float, enable_vfi: bool) -> VideoEnhancePlan:
+def _plan(
+    enable_sr: bool,
+    spatial_mode: str,
+    enable_nr: bool,
+    nr_profile: str,
+    nr_intensity: float,
+    enable_vfi: bool,
+    stage_order: str = STAGE_ORDER_DLSS_THEN_VFI,
+) -> VideoEnhancePlan:
     return VideoEnhancePlan(
         enable_super_resolution=bool(enable_sr),
         sr_scale=spatial_scale(spatial_mode),
@@ -70,6 +102,7 @@ def _plan(enable_sr: bool, spatial_mode: str, enable_nr: bool, nr_profile: str, 
         nr_intensity=float(nr_intensity),
         enable_frame_interpolation=bool(enable_vfi),
         interpolation_factor=2,
+        stage_order=stage_order,
     )
 
 
@@ -89,6 +122,30 @@ def _batch_from_numpy(frames):
     import torch
 
     return torch.from_numpy(np.ascontiguousarray(frames))
+
+
+def require_output_ram(required_bytes: int) -> None:
+    """Reject a final IMAGE batch that would not fit safely in the free RAM.
+
+    The returned IMAGE must be one resident float32 batch, so its exact size is
+    known before the first frame is produced. `MyVideoEnhanceStream` keeps the
+    frames on disk instead of one batch and is the answer when this fails.
+    """
+    import psutil
+
+    try:
+        available = int(psutil.virtual_memory().available)
+    except (psutil.Error, OSError) as error:
+        raise InsufficientRamError(
+            f"cannot read the available RAM to size a {required_bytes} byte IMAGE output: {error}"
+        ) from error
+    if required_bytes > OUTPUT_RAM_FRACTION * available:
+        raise InsufficientRamError(
+            f"the final IMAGE needs {required_bytes} bytes as float32 but only {available} bytes "
+            f"of RAM are available, which is more than {OUTPUT_RAM_FRACTION:.0%} of the free RAM. "
+            "Lower the resolution or frame count, or use MyVideoEnhanceStream, which keeps the "
+            "frames on disk instead of one resident IMAGE batch."
+        )
 
 
 def _status(plan: VideoEnhancePlan, frame_count: int, channel_order: str | None) -> tuple[int, str]:
@@ -165,6 +222,10 @@ class MyVideoEnhance:
                 "worker_timeout": ("FLOAT", {
                     "default": 600.0, "min": 1.0, "max": 86400.0, "step": 1.0, "advanced": True,
                 }),
+                "stage_order": (list(STAGE_ORDERS), {
+                    "default": STAGE_ORDER_DLSS_THEN_VFI, "advanced": True,
+                    "tooltip": STAGE_ORDER_TOOLTIP,
+                }),
             },
         }
 
@@ -191,6 +252,7 @@ class MyVideoEnhance:
         runtime_dir="",
         wine_prefix="",
         worker_timeout=600.0,
+        stage_order=STAGE_ORDER_DLSS_THEN_VFI,
     ):
         plan = _plan(
             enable_super_resolution,
@@ -199,6 +261,7 @@ class MyVideoEnhance:
             nr_profile,
             nr_intensity,
             enable_frame_interpolation,
+            stage_order,
         )
         _check_choice(str(vfi_precision), VFI_PRECISIONS, "vfi_precision")
         _check_choice(str(motion), MOTION_MODES, "motion")
@@ -208,50 +271,50 @@ class MyVideoEnhance:
             _multiplier, status = _status(plan, count, None)
             return (images, 1, status)
 
-        frames = prepare_frames(images) if plan.uses_dlss else _numpy_without_backend(images)
-        resolved_order = None
-        source_count = int(frames.shape[0])
-        progress_state = {"bar": None, "completed": 0}
+        import folder_paths
+
+        frames = prepare_frames(images)
+        source_spec = FrameSpec(
+            count=int(frames.shape[0]), height=int(frames.shape[1]), width=int(frames.shape[2])
+        )
+        specs = pipeline_specs(source_spec, plan)
+        require_output_ram(specs.final.nbytes)
+        # Only the final IMAGE is held in RAM; an intermediate goes to disk.
+        output = np.empty(specs.final.shape, dtype=np.float32)
+
+        def write_frame(index: int, frame) -> None:
+            output[index] = frame
+
+        bar = self._progress_bar(pipeline_step_total(source_spec, plan))
 
         def progress(done: int, _total: int) -> None:
-            # `done` restarts at 1 for VFI, so add the frames the DLSS stage already reported.
-            progress_state["bar"].update_absolute(progress_state["completed"] + done)
+            bar.update_absolute(done)
 
-        if plan.uses_dlss:
-            # VFI interpolates the DLSS output, whose count is still the source count.
-            vfi_steps = max(0, source_count - 1) if plan.uses_frame_interpolation else 0
-            progress_state["bar"] = self._progress_bar(source_count + vfi_steps)
-            result = run_dlss_stage(
-                plan,
-                frames,
+        result = run_frame_pipeline(
+            frames,
+            source_spec,
+            plan,
+            write_frame,
+            temp_directory=folder_paths.get_temp_directory() if specs.staged else None,
+            progress=progress,
+            interrupt=comfy_interrupt,
+            vfi=VfiStageOptions(
+                precision=str(vfi_precision),
+                models_dir=folder_paths.models_dir,
+                ds_factor=float(vfi_ds_factor),
+            ),
+            dlss=DlssStageOptions(
                 runtime_dir=resolve_runtime_dir(str(runtime_dir)),
-                wine_prefix=str(wine_prefix),
-                channel_order=str(channel_order),
                 motion_mode=str(motion),
                 scene_cut_threshold=float(scene_cut_threshold),
+                channel_order=str(channel_order),
+                wine_prefix=str(wine_prefix),
                 timeout=float(worker_timeout),
-                progress=progress,
-                interrupt=comfy_interrupt,
                 memory_hooks=default_memory_hooks(),
-            )
-            frames = result.frames
-            resolved_order = result.channel_order
-            progress_state["completed"] = source_count
-        if plan.uses_frame_interpolation:
-            import folder_paths
-
-            if progress_state["bar"] is None:
-                progress_state["bar"] = self._progress_bar(max(0, int(frames.shape[0]) - 1))
-            frames = interpolate_offline(
-                frames,
-                precision=str(vfi_precision),
-                ds_factor=float(vfi_ds_factor),
-                models_dir=folder_paths.models_dir,
-                progress=progress,
-                interrupt=comfy_interrupt,
-            )
-        multiplier, status = _status(plan, int(frames.shape[0]), resolved_order)
-        return (_batch_from_numpy(frames), multiplier, status)
+            ),
+        )
+        multiplier, status = _status(plan, result.frame_count, result.channel_order)
+        return (_batch_from_numpy(output), multiplier, status)
 
     @staticmethod
     def _progress_bar(total: int):
@@ -282,6 +345,7 @@ class MyVideoEnhance:
                     io.String.Input("runtime_dir", default="", advanced=True),
                     io.String.Input("wine_prefix", default="", advanced=True),
                     io.Float.Input("worker_timeout", default=600.0, min=1.0, max=86400.0, step=1.0, advanced=True),
+                    io.Combo.Input("stage_order", options=list(STAGE_ORDERS), default=STAGE_ORDER_DLSS_THEN_VFI, advanced=True, tooltip=STAGE_ORDER_TOOLTIP),
                 ],
                 outputs=[
                     io.Image.Output(display_name="images"),
@@ -398,17 +462,3 @@ class MyDLSSRuntimeProbe:
         def execute(cls, **kwargs):
             status, = cls().probe(**kwargs)
             return io.NodeOutput(status)
-
-
-def _numpy_without_backend(images):
-    """CPU float32 copy for the VFI-only path. Does not start DLSS or GIMM."""
-    if hasattr(images, "detach"):
-        batch = images.detach().cpu().numpy()
-    else:
-        batch = np.asarray(images)
-    if batch.ndim != 4 or batch.shape[-1] != 3 or batch.shape[0] < 1:
-        raise ValueError(f"expected IMAGE batch [N,H,W,3], got shape {getattr(batch, 'shape', None)}")
-    frames = np.ascontiguousarray(batch, dtype=np.float32)
-    if not np.isfinite(frames).all():
-        raise ValueError("IMAGE batch contains non-finite values")
-    return frames

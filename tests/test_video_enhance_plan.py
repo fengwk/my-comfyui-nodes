@@ -7,6 +7,9 @@ from my_nodes.core.video_enhance.plan import (
     NR_PROFILES,
     SR_SCALES,
     STAGE_DLSS,
+    STAGE_ORDER_DLSS_THEN_VFI,
+    STAGE_ORDER_VFI_THEN_DLSS,
+    STAGE_ORDERS,
     STAGE_VFI,
     VideoEnhancePlan,
 )
@@ -126,6 +129,70 @@ class PlanStageTests(unittest.TestCase):
         self.assertEqual(
             VideoEnhancePlan(enable_super_resolution=True, sr_scale=2),
             VideoEnhancePlan(enable_super_resolution=True, sr_scale=2.0),
+        )
+
+
+class PlanStageOrderTests(unittest.TestCase):
+    def test_legacy_default_order_is_dlss_then_vfi(self) -> None:
+        self.assertEqual(VideoEnhancePlan().stage_order, STAGE_ORDER_DLSS_THEN_VFI)
+        self.assertEqual(STAGE_ORDERS[0], STAGE_ORDER_DLSS_THEN_VFI)
+        plan = VideoEnhancePlan(
+            enable_super_resolution=True, enable_frame_interpolation=True
+        )
+        self.assertEqual(plan.stages, (STAGE_DLSS, STAGE_VFI))
+        self.assertTrue(plan.uses_both_stages)
+
+    def test_vfi_then_dlss_reverses_the_two_active_stages(self) -> None:
+        plan = VideoEnhancePlan(
+            enable_super_resolution=True,
+            enable_frame_interpolation=True,
+            stage_order=STAGE_ORDER_VFI_THEN_DLSS,
+        )
+        self.assertEqual(plan.stages, (STAGE_VFI, STAGE_DLSS))
+
+    def test_stage_order_does_not_change_a_single_active_stage(self) -> None:
+        for order in STAGE_ORDERS:
+            with self.subTest(order=order):
+                dlss_only = VideoEnhancePlan(enable_neural_rendering=True, stage_order=order)
+                self.assertEqual(dlss_only.stages, (STAGE_DLSS,))
+                self.assertFalse(dlss_only.uses_both_stages)
+                vfi_only = VideoEnhancePlan(enable_frame_interpolation=True, stage_order=order)
+                self.assertEqual(vfi_only.stages, (STAGE_VFI,))
+        self.assertEqual(
+            VideoEnhancePlan(enable_neural_rendering=True).stages,
+            VideoEnhancePlan(
+                enable_neural_rendering=True, stage_order=STAGE_ORDER_VFI_THEN_DLSS
+            ).stages,
+        )
+
+    def test_disabled_stage_is_still_removed_from_the_requested_order(self) -> None:
+        plan = VideoEnhancePlan(
+            enable_frame_interpolation=True,
+            stage_order=STAGE_ORDER_VFI_THEN_DLSS,
+        )
+        self.assertEqual(plan.stages, (STAGE_VFI,))
+        self.assertNotIn(STAGE_DLSS, plan.stages)
+
+    def test_unknown_stage_order_is_rejected_even_when_disabled(self) -> None:
+        with self.assertRaises(ValueError):
+            VideoEnhancePlan(stage_order="vfi_dlss_parallel")
+
+    def test_wrong_stage_order_type_is_rejected(self) -> None:
+        with self.assertRaises(TypeError):
+            VideoEnhancePlan(stage_order=None)
+
+    def test_stage_order_is_part_of_plan_equality(self) -> None:
+        self.assertNotEqual(
+            VideoEnhancePlan(
+                enable_super_resolution=True,
+                enable_frame_interpolation=True,
+                stage_order=STAGE_ORDER_DLSS_THEN_VFI,
+            ),
+            VideoEnhancePlan(
+                enable_super_resolution=True,
+                enable_frame_interpolation=True,
+                stage_order=STAGE_ORDER_VFI_THEN_DLSS,
+            ),
         )
 
 

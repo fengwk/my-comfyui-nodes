@@ -13,6 +13,11 @@ block ends, whatever happened inside it.
 * stderr is drained while waiting and kept bounded (tail) for error messages.
 * the interrupt callback is polled while waiting; a truthy return raises
   `ProcessInterrupted` and an exception it raises propagates unchanged.
+* `wait_exit` is the plain `waitpid`, while `wait_exit_draining` is the safe wait
+  for a caller that only needs the child gone: it keeps draining both pipes
+  (stdout is discarded, stderr stays bounded) and polls the interrupt callback,
+  so a child that reports more than one pipe buffer before exiting cannot wedge
+  the caller on a full pipe.
 * every exit path closes stdin, terminates the process *group* with SIGTERM,
   escalates to SIGKILL and reaps - including for a `BaseException` such as a
   ComfyUI interrupt. Cleanup errors never mask an exception already on its way
@@ -38,7 +43,7 @@ DEFAULT_TIMEOUT_SECONDS = 600.0
 TERMINATE_GRACE_SECONDS = 2.0
 POLL_INTERVAL_SECONDS = 0.05
 STDERR_LIMIT_BYTES = 8 * 1024
-STDERR_CHUNK_BYTES = 4096
+DRAIN_CHUNK_BYTES = 4096
 STDERR_SETTLE_SECONDS = 0.5
 WRITE_CHUNK_BYTES = 1 << 16
 
@@ -202,7 +207,12 @@ class ScopedProcess:
         return b"".join(chunks)
 
     def wait_exit(self, timeout: float) -> bool:
-        """Wait up to `timeout` seconds for the child; True once it was reaped."""
+        """Wait up to `timeout` seconds for the child; True once it was reaped.
+
+        A plain `waitpid`. It never reads a pipe, so a child that writes more
+        than one pipe buffer before it exits keeps this wait running until the
+        timeout; use `wait_exit_draining` when the child may still be writing.
+        """
         process = self._process
         if process is None:
             return True
@@ -215,6 +225,41 @@ class ScopedProcess:
             return True
         except subprocess.TimeoutExpired:
             return False
+
+    def wait_exit_draining(self, timeout: float | None = None, *, what: str = "exit") -> bool:
+        """Wait for the child to exit while draining its pipes; True once reaped.
+
+        This is the wait for the finalization paths, where the caller has
+        already taken everything it wants and only needs the child to be gone:
+        stdout is drained and discarded, stderr is drained into the bounded tail,
+        the interrupt callback is polled (`ProcessInterrupted` when it asks) and
+        the deadline ends the wait with `False`. Draining is what keeps a child
+        that reports more than one pipe buffer of diagnostics before exiting from
+        blocking forever on a full stderr pipe, and nothing is ever accumulated
+        beyond the bounded tail.
+        """
+        process = self._process
+        if process is None:
+            return True
+        limit = self._timeout if timeout is None else float(timeout)
+        deadline = time.monotonic() + max(limit, 0.0)
+        while True:
+            if process.poll() is not None:
+                self._settle_output(time.monotonic() + STDERR_SETTLE_SECONDS)
+                return True
+            self._check_interrupt(what)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            try:
+                ready = self._selector.select(min(remaining, self._poll_interval))
+            except OSError as exc:
+                raise ProcessIOError(f"cannot poll {self._describe()}: {exc}") from exc
+            for key, _mask in ready:
+                if key.data == "stderr":
+                    self._read_stderr()
+                else:
+                    self._read_stdout()
 
     def close_stdin(self) -> None:
         """Close the child's stdin: the usual "no more input" signal."""
@@ -259,15 +304,28 @@ class ScopedProcess:
         except OSError as exc:
             raise ProcessError(f"cannot start {self._command[0]}: {exc}") from exc
         process = self._process
-        assert process.stdin is not None and process.stdout is not None and process.stderr is not None
-        self._in_fd = process.stdin.fileno()
-        self._out_fd = process.stdout.fileno()
-        self._err_fd = process.stderr.fileno()
-        os.set_blocking(self._in_fd, False)
-        os.set_blocking(self._out_fd, False)
-        os.set_blocking(self._err_fd, False)
-        self._selector.register(self._out_fd, selectors.EVENT_READ, "stdout")
-        self._selector.register(self._err_fd, selectors.EVENT_READ, "stderr")
+        # From here on the child exists, so every failure has to take it down
+        # with it: fd setup and selector registration can still raise (an
+        # exhausted fd table, a BaseException cancel), and nothing else owns the
+        # child yet.
+        try:
+            assert (
+                process.stdin is not None
+                and process.stdout is not None
+                and process.stderr is not None
+            )
+            self._in_fd = process.stdin.fileno()
+            self._out_fd = process.stdout.fileno()
+            self._err_fd = process.stderr.fileno()
+            os.set_blocking(self._in_fd, False)
+            os.set_blocking(self._out_fd, False)
+            os.set_blocking(self._err_fd, False)
+            self._selector.register(self._out_fd, selectors.EVENT_READ, "stdout")
+            self._selector.register(self._err_fd, selectors.EVENT_READ, "stderr")
+        except BaseException:
+            self._kill_quietly()
+            self._release()
+            raise
 
     def _register_write(self) -> None:
         if self._writing or self._in_fd is None:
@@ -338,7 +396,7 @@ class ScopedProcess:
         if self._err_fd is None:
             return
         try:
-            chunk = os.read(self._err_fd, STDERR_CHUNK_BYTES)
+            chunk = os.read(self._err_fd, DRAIN_CHUNK_BYTES)
         except (BlockingIOError, InterruptedError):
             return
         except OSError:
@@ -349,6 +407,53 @@ class ScopedProcess:
             self._drop_stderr_stream()
             return
         self._append_stderr(chunk)
+
+    def _read_stdout(self) -> None:
+        """Slide off whatever is left on stdout; the caller has its own bytes.
+
+        Nothing is kept: at this point the caller has already read what it
+        wanted, and the child may still be writing (a decoder that ran past its
+        frame count, an encoder that echoes progress). Draining it is what keeps
+        that child from blocking on a full stdout pipe.
+        """
+        if self._out_fd is None:
+            return
+        try:
+            chunk = os.read(self._out_fd, DRAIN_CHUNK_BYTES)
+        except (BlockingIOError, InterruptedError):
+            return
+        except OSError:
+            self._drop_stdout_stream()
+            return
+        if not chunk:
+            self._drop_stdout_stream()
+
+    def _drop_stdout_stream(self) -> None:
+        if self._out_fd is None:
+            return
+        try:
+            self._selector.unregister(self._out_fd)
+        except (KeyError, ValueError, OSError):
+            pass
+        self._out_fd = None
+
+    def _settle_output(self, deadline: float) -> None:
+        """Collect the last output of a child that has already been reaped."""
+        while self._err_fd is not None or self._out_fd is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            try:
+                ready = self._selector.select(min(remaining, self._poll_interval))
+            except OSError:
+                return
+            if not ready:
+                return
+            for key, _mask in ready:
+                if key.data == "stderr":
+                    self._read_stderr()
+                else:
+                    self._read_stdout()
 
     def _drop_stderr_stream(self) -> None:
         if self._err_fd is None:

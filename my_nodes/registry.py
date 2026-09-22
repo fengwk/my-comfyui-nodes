@@ -11,6 +11,12 @@ import logging
 
 from my_nodes.nodes.inject_tail_chroma_noise import InjectTailChromaNoise
 
+# Video enhance stays importable without torch/Comfy/GIMM. Registration itself
+# must not start a backend; the nodes import those only when a stage is enabled,
+# so these are plain top-level imports rather than guarded ones.
+from my_nodes.nodes.video_enhance import MyDLSSRuntimeProbe, MyVideoEnhance
+from my_nodes.nodes.video_enhance_stream import MyVideoEnhanceStream
+
 NODE_CLASSES = (
     InjectTailChromaNoise,
 )
@@ -37,11 +43,7 @@ except ImportError as exc:
 if SelfLiftH3Sampler is not None:
     NODE_CLASSES = NODE_CLASSES + (SelfLiftH3Sampler,)
 
-# Video enhance stays importable without torch/Comfy/GIMM. Registration itself
-# must not start a backend; the node imports those only when a stage is enabled.
-from my_nodes.nodes.video_enhance import MyDLSSRuntimeProbe, MyVideoEnhance
-
-NODE_CLASSES = NODE_CLASSES + (MyVideoEnhance, MyDLSSRuntimeProbe)
+NODE_CLASSES = NODE_CLASSES + (MyVideoEnhance, MyDLSSRuntimeProbe, MyVideoEnhanceStream)
 
 
 def _node_id(cls):

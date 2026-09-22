@@ -10,12 +10,17 @@ git clone https://github.com/fengwk/my-comfyui-nodes.git
 # 或: ln -s /path/to/my-comfyui-nodes /path/to/ComfyUI/custom_nodes/my-comfyui-nodes
 ```
 
-依赖：`numpy`、`Pillow`（Comfy 环境一般已有）。
+依赖：`numpy`、`Pillow`（Comfy 环境一般已有）。流式节点 `My Video Enhance Stream` 另外要求
+`PATH` 上有 FFmpeg 5.1+ 的 `ffmpeg` 和 `ffprobe`（找不到时直接报缺失的工具名）。
+IMAGE 输出的 RAM 预检使用 ComfyUI 已有依赖 `psutil`，无需额外安装。
 
 可选：`vendor/sol_attn_minimax_v2.py` 需要 comfy-kitchen 的 `sol_attn` 内核
 （Kijai `sol_attn` 分支构建，官方 PyPI 包不含）。缺失时该节点不注册，其余节点不受影响。
 
-## 输入约定：用 IMAGE 批次，不要图片列表
+## IMAGE 工作流的输入约定：用 IMAGE 批次，不要图片列表
+
+本节只适用于 IMAGE 流程。原生 `VIDEO` 输入不拼 IMAGE 批次，走
+[`My Video Enhance Stream`](#my-video-enhance-stream)。
 
 Comfy 的视频帧标准类型是 `IMAGE`：形状 `[N, H, W, C]`、float32、`[0, 1]`。
 
@@ -89,18 +94,29 @@ ModelAttentionBackend 已有的 attention。
 
 ### My Video Enhance
 
-三个开关独立，顺序固定：DLSS feature 1（DLAA / 超分）→ 可选 feature 18 神经渲染（同一个 Wine worker）→ worker 退出后，可选离线 GIMM-VFI 2x。关掉的阶段不会被调用；打开但缺文件时直接报路径，没有静默回退。
+`IMAGE → IMAGE`，全部阶段关闭时输入对象原样返回（pass-through 兼容）。三个开关独立；两个阶段同时开启时先后由 `stage_order` 决定，默认 `dlss_then_vfi` 就是旧的固定顺序。默认链路：DLSS feature 1（DLAA / 超分）→ 可选 feature 18 神经渲染（同一个 Wine worker）→ worker 退出后，可选离线 GIMM-VFI 2x；`vfi_then_dlss` 则先插帧，再增强插出来的帧。关掉的阶段不会被调用；打开但缺文件时直接报路径，没有静默回退。
 
 | 输入 | 默认 | 含义 |
 |---|---|---|
 | `enable_super_resolution` | false | feature 1。`1.0 DLAA (native)` 是原生分辨率抗锯齿，不是放大 |
 | `spatial_mode` | `2.0x` | `1.0 DLAA (native)` / `1.5x` / `2.0x` / `3.0x` |
 | `enable_neural_rendering` | false | feature 18，实验性。`light/standard/portrait/detail` 是本节点的 UX 映射，不是 NVIDIA 官方预设 |
+| `nr_profile` / `nr_intensity` | `standard` / `1.0` | 上面的 UX profile 与强度（0.0–2.0），只换 profile 的基础强度，其余字段固定 |
 | `enable_frame_interpolation` | false | 离线 GIMM-VFI-R，固定 2 倍。不是 DLSS Frame Generation |
 | `vfi_precision` / `vfi_ds_factor` | `fp32` / `1.0` | 高级项。权重必须已在磁盘上，节点不会下载 |
 | `motion` / `scene_cut_threshold` | `optical_flow` / `0.2` | 高级项。DIS 估计当前帧到前一帧的反向像素光流；切镜时重置时序历史 |
+| `channel_order` | `auto` | 高级项。DNR3 回读纹理的通道顺序：`auto` 用第一帧对比源帧判定一次，然后整段沿用；异常时可强制 `RGBA` / `BGRA` |
+| `runtime_dir` / `wine_prefix` | 空 | 高级项。空时依次回退环境变量与默认路径，见下面的配置指南 |
+| `worker_timeout` | 600.0 | 高级项。DLSS worker 单次读写等待的超时秒数（1–86400），不是整段视频总时限 |
+| `stage_order` | `dlss_then_vfi` | 高级项。两个阶段同时开启时的顺序：`dlss_then_vfi` 先 DLSS 再对结果插帧，`vfi_then_dlss` 先插帧再增强。只有一个阶段时该值不改变行为 |
 
 N 帧插值后是 `2*N-1` 帧。`fps_multiplier` 只在插值真正跑过时为 2，编码时用输入 FPS 的 2 倍。单帧和关闭插值都是 1。
+
+#### 阶段顺序、磁盘中间帧与内存
+
+- 两个阶段同时开启时，第一阶段的结果完整写进 Comfy 临时目录下的 float32 `np.memmap` 中间文件；第一阶段的模型/子进程完全拆除后第二阶段才开始，所以 GIMM 与 Wine/DLSS worker 不会同时在显存里。文件按固定大小分块映射，默认每块最多 256MiB（至少一整帧），切换时释放旧映射，避免整文件映射的 RSS 随片长增长。
+- 中间文件需要的空闲空间是 `中间帧数 × H × W × 3 × 4` 字节：`dlss_then_vfi` 的中间帧是超分后的尺寸，`vfi_then_dlss` 的是 `2N-1` 帧的原始尺寸。空间不足在开跑前就会报出所需/可用字节数。临时中间文件在成功、报错和 Comfy 取消时都会删掉。
+- 返回的 `IMAGE` 必须是一整块常驻内存的 float32 批次。节点在开跑前按最终 `N×H×W×3×4` 精确预检，超过**当前可用 RAM 的 80%** 直接拒绝（错误里给出所需/可用字节数），并建议改用 `MyVideoEnhanceStream`——它把帧留在磁盘上。
 
 #### DLSS 运行时与 Wine 依赖配置指南
 
@@ -176,8 +192,64 @@ Wine 的 Direct3D 12 驱动在初始化交换链与离屏渲染上下文时，�
 - **DLSS-NR（神经渲染 Feature 18）**：
   - 属于实验性功能，底层调度要求 NVIDIA 驱动版本 ≥ 616.56。在低于 616.56 的驱动上执行可能会因 GPU fence 同步挂起超时。若当前系统驱动未满足要求，请保持 `enable_neural_rendering: false`。
 - **插帧（VFI）**：
-  - RTX 3090 硬件不支持 DLSS 3 Frame Generation（仅 RTX 40+ 支持）。本节点内置了基于 S-Lab GIMM-VFI 的纯离线高质量光流补帧，在 Wine 进程退出后独立执行，不受 DLSS 硬件代际限制。
+  - RTX 3090 硬件不支持 DLSS 3 Frame Generation（仅 RTX 40+ 支持）。本节点内置了基于 S-Lab GIMM-VFI 的纯离线高质量光流补帧，在独立阶段执行，不受 DLSS 硬件代际限制；默认顺序 `dlss_then_vfi` 下它跑在 Wine worker 退出之后，`vfi_then_dlss` 下跑在 worker 启动之前。
   - 权重位于 `models/interpolation/gimm-vfi/gimmvfi_r_arb_lpips_fp32.safetensors` 和 `raft-things_fp32.safetensors`。
+
+### My Video Enhance Stream
+
+原生 `VIDEO → VIDEO, INT, STRING`（`video` / `interpolation_multiplier` / `status`）。它把与 `My Video Enhance` 完全相同的阶段一次一帧地跑完，长片段不需要把整段帧塞进 RAM。DLSS 运行时、Wine 前缀与驱动要求同上一节。推荐接线：
+
+```text
+LoadVideo
+  → My Video Enhance Stream      # VIDEO + 倍数 + 状态串
+    → SaveVideo                  # 推荐 format=mkv、codec=auto，避免重复编码
+```
+
+可导入示例：[video_enhance_stream.json](docs/video_enhance_stream.json)。默认先用 fp16 插帧、再 DLSS 2x，NR 关闭；加载后在 `LoadVideo` 选择自己的输入文件。
+
+增强开关与高级项和上一节相同（`enable_super_resolution` / `spatial_mode` / `enable_neural_rendering` / `nr_profile` / `nr_intensity` / `enable_frame_interpolation` / `vfi_precision` / `vfi_ds_factor` / `motion` / `scene_cut_threshold` / `channel_order` / `runtime_dir` / `wine_prefix` / `worker_timeout`，含义见上一节）。流式节点新增或默认值不同的输入：
+
+| 输入 | 默认 | 含义 |
+|---|---|---|
+| `video` | — | 本地的、可 seek 的、文件型 VIDEO |
+| `output_codec` | `libx264` | 编码器。`libx264` 是 CPU 默认；`h264_nvenc` 走 NVENC，需要受支持的 GPU |
+| `quality` | 18 | 0–51，越小越好也越大：libx264 是 CRF，h264_nvenc 是 CQ |
+| `stage_order` | `vfi_then_dlss` | 高级项。**默认与 IMAGE 节点相反**：两阶段同时开启时先插帧，让光流落在原始分辨率上，比先超分再对放大帧做光流更省显存 |
+
+#### v1 接受的输入
+
+只接受本地、可 seek 的**文件型** VIDEO，必须是整段未裁剪、CFR、8-bit SDR。以下情况直接报错，不会静默降级：
+
+- 可变帧率（VFR）或时间戳与声明帧率不符；URL / 管道 / 实时源。
+- 非文件型 VIDEO：内存型或组件型，以及没有原生 VIDEO API 的输入。
+- 带 active trim window 的 VIDEO——请先将裁剪结果保存为独立文件，再重新 `LoadVideo`；仅连接 `Trim Video` 不会物化裁剪结果。
+- HDR（PQ / HLG / BT.2020）、10/12-bit 及浮点像素格式。
+- 带旋转、翻转等非单位显示矩阵或非方形像素（SAR 不为 1:1）的文件；需先归一化，错误信息中提供操作指引。
+
+#### 音频与输出
+
+- 源文件的第一条音轨原样 stream copy 进输出；不合成音频，源没有音频就没有音轨。字幕、metadata、其余音轨不做保留承诺。
+- 输出固定 8-bit `yuv420p` Matroska，写在 Comfy 临时目录（`my_nodes_enhance_stream_*_<uuid>.mkv`），包装成 `VideoFromFile` 返回；要长期保存由下游 `SaveVideo` 决定落盘位置。
+- 输出宽高必须是偶数——`yuv420p` 的要求，不满足时编码器直接报出实际宽高。DLAA（1.0x）保持源尺寸，所以奇数尺寸的源在这一档会直接失败；超分档由节点向上取偶。
+- `status` 里带阶段、帧数、`output_fps`、`codec`、`quality` 以及音频处理结果。
+
+#### 帧数与 FPS
+
+插帧固定 2 倍：`N` 帧进、`2N-1` 帧出。输出 FPS 只在插帧真的有源帧对（源至少 2 帧）时才是源 FPS 的 2 倍；单帧片段保持源 FPS，`interpolation_multiplier` 也返回 1。两个 `stage_order` 都保证 GIMM 与 Wine/DLSS 不同时驻留。
+
+#### 资源与临时文件
+
+- 单阶段只保留少量帧缓冲；双阶段额外保留一个映射块，默认最多 256MiB（至少一帧）。固定分辨率下，帧缓冲与映射的 RSS 上界不随片长增长；模型、编解码器缓冲以及系统可回收文件缓存另计。
+- 中间 float32 暂存同样是 `中间帧数 × H × W × 3 × 4` 字节，写在 Comfy 临时目录下，建议使用磁盘而非 tmpfs；最终编码及音频复用文件另外占空间。节点预检中间文件所需空间，不预估压缩后文件大小，也不能阻止其他进程运行中占满磁盘。
+- 中间帧 memmap、只写视频的中间文件、失败/取消时的半成品输出在成功、报错和 Comfy 取消时都会清掉；成功后的最终临时文件保留，因为返回的 VIDEO 仍指向它。
+- 源文件解码两遍：一次 ffprobe 的 O(1) 内存 CFR / 帧数扫描，一次真正的逐帧处理。
+- 全部阶段关闭时是纯 pass-through：不探测、不解码、不编码，输入 VIDEO 原样返回。
+
+#### 实测记录
+
+- RTX 3090 上两个 `stage_order` 均通过真实跨分块验证：3 帧 → 5 帧、128×128 → 256×256、3fps → 6fps，AAC 音轨保留；`h264_nvenc` 也实测通过。
+- 实际 720p 素材：241 帧 1280×720/24fps，经 fp16 VFI → DLSS 2x → libx264 quality 18，得到 481 帧 2560×1440/48fps，音轨保留，耗时约 515 秒。主进程阶段采样 RSS 为 2656–2970MiB，编解码器/Wine 子进程另计；进入 DLSS 后及运行结束时，PyTorch 已分配 CUDA 显存为 0。
+- 中间帧存储的独立 RSS 回归覆盖 20,000 帧、245.8MB 原始文件：1MiB 测试分块下额外峰值 RSS 约 1MiB，而非整文件大小。以上不等同于小时级长视频、所有容器/音轨时间轴的生产验证。
 
 ### My DLSS Runtime Probe
 

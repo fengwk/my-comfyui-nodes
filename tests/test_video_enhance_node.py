@@ -3,11 +3,14 @@
 The DLSS path drives the existing real-pipe fake DNR3 worker. GIMM is represented
 by stand-in node classes and a real torch.nn.Module; the S-Lab implementation is
 not imported. Comfy's model manager is stubbed so the test records ModelPatcher
-lifecycle calls, including cleanup after a BaseException.
+lifecycle calls, including cleanup after a BaseException. The node itself is
+covered through the shared frame pipeline, whose stage order and disk staging are
+asserted in `test_video_enhance_frame_pipeline.py`.
 """
 
 from __future__ import annotations
 
+import contextlib
 import os
 import tempfile
 import types
@@ -26,6 +29,7 @@ from my_nodes.core.video_enhance.dlss_stage import (
     resolve_runtime_dir,
     run_dlss_stage,
 )
+from my_nodes.core.video_enhance.frame_pipeline import FrameSpec, PipelineResult
 from my_nodes.core.video_enhance.gimm_vfi import (
     GIMM_FLOW_NAME,
     GIMM_MODEL_NAME,
@@ -34,17 +38,26 @@ from my_nodes.core.video_enhance.gimm_vfi import (
     _clear_gimm_backwarp_cache,
     clear_patcher_cache,
     interpolate_offline,
+    iter_interpolate_offline,
     require_offline_weights,
     resolve_gimm_nodes,
 )
 from my_nodes.core.video_enhance.motion import MOTION_NONE, MotionGuideError, MotionGuides
 from my_nodes.core.video_enhance.nr_profiles import neural_rendering_settings
-from my_nodes.core.video_enhance.plan import NR_PROFILES, VideoEnhancePlan
+from my_nodes.core.video_enhance.plan import (
+    NR_PROFILES,
+    STAGE_ORDER_DLSS_THEN_VFI,
+    STAGE_ORDER_VFI_THEN_DLSS,
+    STAGE_ORDERS,
+    VideoEnhancePlan,
+)
 from my_nodes.core.video_enhance.runtime import HostDriver
 from my_nodes.nodes.video_enhance import (
     SPATIAL_LABELS,
+    InsufficientRamError,
     MyDLSSRuntimeProbe,
     MyVideoEnhance,
+    OUTPUT_RAM_FRACTION,
     spatial_scale,
 )
 from my_nodes.registry import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
@@ -477,23 +490,25 @@ class GimmLifecycleTests(unittest.TestCase):
         _clear_cublas_workspaces(types.SimpleNamespace(_C=types.SimpleNamespace()))
         self.assertEqual(calls, ["clear"])
 
-    def _run(self, frames: np.ndarray, memory: _Memory):
-        import sys
-        import torch
-        import comfy.model_management as mm
-        from comfy.model_patcher import ModelPatcher
-
+    def _mappings(self, memory: _Memory) -> dict:
         class _RecordingLoader(_Loader):
             def loadmodel(self, model, precision="fp32", torch_compile=False):
                 memory.events.append("model_loader")
                 return super().loadmodel(model, precision, torch_compile)
 
-        mappings = {
+        return {
             "DownloadAndLoadGIMMVFIModel": _RecordingLoader,
             "GIMMVFI_interpolate": _Interpolator,
         }
-        # The production function imports model_management locally, so patch the
-        # module object it receives rather than the caller's name binding.
+
+    @contextlib.contextmanager
+    def _comfy(self, memory: _Memory):
+        """Patch the external model manager and caches the stages talk to."""
+        import sys
+        import comfy.model_management as mm
+
+        # The production functions import model_management locally, so patch the
+        # module object they receive rather than the caller's name binding.
         with mock.patch.object(mm, "free_memory", memory.free_memory), \
              mock.patch.object(mm, "load_models_gpu", memory.load_models_gpu), \
              mock.patch.object(mm, "unload_model_and_clones", memory.unload_model_and_clones), \
@@ -504,6 +519,14 @@ class GimmLifecycleTests(unittest.TestCase):
                  side_effect=lambda _torch: memory.events.append("cublas"),
              ), \
              mock.patch.dict(sys.modules, {"comfy.model_management": mm}):
+            yield
+
+    def _run(self, frames: np.ndarray, memory: _Memory):
+        import torch
+        from comfy.model_patcher import ModelPatcher
+
+        mappings = self._mappings(memory)
+        with self._comfy(memory):
             output = interpolate_offline(
                 frames,
                 precision="fp32",
@@ -516,6 +539,69 @@ class GimmLifecycleTests(unittest.TestCase):
         self.assertIsInstance(memory.loaded[0][0], ModelPatcher)
         self.assertIsInstance(memory.loaded[0][0].model, torch.nn.Module)
         return output
+
+    def _open_stream(self, frames: np.ndarray, memory: _Memory, count: int | None = None):
+        """Open the incremental stage under the same patched model manager."""
+        import torch
+
+        return iter_interpolate_offline(
+            frames,
+            int(frames.shape[0]) if count is None else count,
+            precision="fp32",
+            ds_factor=1.0,
+            models_dir=self.models,
+            node_mappings=self._mappings(memory),
+            load_device=torch.device("cpu"),
+            interrupt=memory.throw_exception_if_processing_interrupted,
+        )
+
+    def _drain(self, frames: np.ndarray, memory: _Memory, count: int | None = None) -> np.ndarray:
+        with self._comfy(memory):
+            stream = self._open_stream(frames, memory, count)
+            collected = []
+            try:
+                for frame in stream:
+                    collected.append(np.array(frame))
+            finally:
+                stream.close()
+        return np.stack(collected) if collected else np.empty((0, frames.shape[1], frames.shape[2], 3), dtype=np.float32)
+
+    def test_the_incremental_stage_returns_what_the_wrapper_returns(self) -> None:
+        # The wrapper is a collector over the iterator: same frames, same order.
+        frames = _batch(_frame(value=0.0), _frame(value=0.4), _frame(value=0.8))
+        wrapper = self._run(frames, _Memory())
+        incremental = self._drain(frames, _Memory())
+        np.testing.assert_array_equal(incremental, wrapper)
+        self.assertEqual(incremental.dtype, np.float32)
+
+    def test_the_incremental_stage_yields_frames_while_the_model_is_loaded(self) -> None:
+        # The streaming contract: a frame arrives before the next pair is built,
+        # and closing the abandoned stage still unloads the model.
+        frames = _batch(_frame(value=0.0), _frame(value=0.4), _frame(value=0.8))
+        memory = _Memory()
+        with self._comfy(memory):
+            stream = self._open_stream(frames, memory)
+            try:
+                first = np.array(next(stream))
+                self.assertIn("load", memory.events)
+                self.assertNotIn("unload", memory.events)
+                second = np.array(next(stream))
+                self.assertNotIn("unload", memory.events)
+            finally:
+                stream.close()
+        np.testing.assert_allclose(first, frames[0])
+        np.testing.assert_allclose(second, (frames[0] + frames[1]) / 2)
+        self.assertIn("unload", memory.events)
+        self.assertEqual(len(memory.unloaded), 1)
+
+    def test_the_incremental_stage_rejects_a_short_source_and_unloads(self) -> None:
+        frames = _batch(_frame(value=0.0), _frame(value=0.4), _frame(value=0.8))
+        memory = _Memory()
+        with self.assertRaises(GimmVfiError) as raised:
+            self._drain(frames, memory, count=4)
+        self.assertIn("ended early", str(raised.exception))
+        self.assertEqual(len(memory.unloaded), 1)
+        self.assertEqual(memory.caches, 2)
 
     def test_pairs_are_assembled_without_duplicate_boundaries(self) -> None:
         memory = _Memory()
@@ -595,44 +681,50 @@ class NodeContractTests(unittest.TestCase):
         self.assertIn("DLAA", SPATIAL_LABELS[0])
         self.assertEqual(spatial_scale("1.0 DLAA (native)"), 1.0)
 
+    def test_legacy_schema_keeps_its_widgets_and_appends_stage_order(self) -> None:
+        types = MyVideoEnhance.INPUT_TYPES()
+        optional = list(types["optional"])
+        self.assertEqual(optional[:3], ["vfi_precision", "vfi_ds_factor", "motion"])
+        self.assertEqual(optional[-1], "stage_order")
+        options, widget = types["optional"]["stage_order"]
+        self.assertEqual(options, list(STAGE_ORDERS))
+        self.assertEqual(widget["default"], STAGE_ORDER_DLSS_THEN_VFI)
+        self.assertTrue(widget["advanced"])
+        self.assertEqual(
+            list(types["required"]),
+            [
+                "images",
+                "enable_super_resolution",
+                "spatial_mode",
+                "enable_neural_rendering",
+                "nr_profile",
+                "nr_intensity",
+                "enable_frame_interpolation",
+            ],
+        )
+
     def test_all_off_returns_the_same_object_and_touches_nothing(self) -> None:
         images = _batch(_frame(), _frame(value=0.7))
-        with mock.patch("my_nodes.core.video_enhance.dlss_stage.run_dlss_stage") as dlss, \
-             mock.patch("my_nodes.core.video_enhance.gimm_vfi.interpolate_offline") as vfi:
+        with mock.patch("my_nodes.nodes.video_enhance.run_frame_pipeline") as pipeline:
             output, multiplier, status = MyVideoEnhance().enhance(
                 images, False, "2.0x", False, "standard", 1.0, False
             )
         self.assertIs(output, images)
         self.assertEqual(multiplier, 1)
         self.assertIn("pass-through", status)
-        dlss.assert_not_called()
-        vfi.assert_not_called()
+        pipeline.assert_not_called()
 
-    def test_dlss_worker_is_closed_before_vfi_starts(self) -> None:
-        # The combined node must not keep the Wine worker alive while GIMM loads.
-        order: list[str] = []
+    def test_an_unknown_stage_order_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            MyVideoEnhance().enhance(
+                _batch(_frame()), True, "2.0x", False, "standard", 1.0, True,
+                stage_order="dlss_and_vfi_in_parallel",
+            )
+
+    def _pipeline_call(self, **enhance_kwargs):
+        """Run the node with pipeline and folder_paths stubbed; return the recorded call."""
         images = _batch(_frame(), _frame(value=0.5))
-
-        def dlss(*_args, **kwargs):
-            order.append("dlss-start")
-            kwargs["progress"](1, 2)
-            kwargs["progress"](2, 2)
-            order.append("dlss-closed")
-            from my_nodes.core.video_enhance.dlss_stage import DlssStageResult
-
-            return DlssStageResult(frames=images, output_width=4, output_height=6, channel_order="RGBA", features=FEATURE_SR)
-
-        def vfi(frames, **kwargs):
-            kwargs["progress"](1, 1)
-            order.append("vfi")
-            self.assertEqual(order, ["dlss-start", "dlss-closed", "vfi"])
-            middle = (frames[0] + frames[1]) / 2
-            return np.stack((frames[0], middle, frames[1]), axis=0)
-
-        import sys
-        import types
-
-        node = MyVideoEnhance()
+        calls: list[dict] = []
         created: list[int] = []
         updates: list[int] = []
 
@@ -644,26 +736,151 @@ class NodeContractTests(unittest.TestCase):
                 del total, preview
                 updates.append(value)
 
+        def fake_pipeline(source, source_spec, plan, write_frame, **kwargs):
+            from my_nodes.core.video_enhance import frame_pipeline
+
+            specs = frame_pipeline.pipeline_specs(source_spec, plan)
+            total = frame_pipeline.pipeline_step_total(source_spec, plan)
+            calls.append(
+                {
+                    "source": np.stack(list(source)),
+                    "spec": source_spec,
+                    "plan": plan,
+                    "created": list(created),
+                    "kwargs": kwargs,
+                }
+            )
+            # The pipeline reports cumulative progress over all stages, then hands
+            # the final frames to the node's writer.
+            for step in range(1, total + 1):
+                if kwargs["progress"] is not None:
+                    kwargs["progress"](step, total)
+            for index in range(specs.final.count):
+                write_frame(
+                    index,
+                    np.full((specs.final.height, specs.final.width, 3), index, dtype=np.float32),
+                )
+            return PipelineResult(
+                frame_count=specs.final.count,
+                output_height=specs.final.height,
+                output_width=specs.final.width,
+                channel_order="RGBA",
+                features=FEATURE_SR,
+                stages=plan.stages,
+            )
+
+        node = MyVideoEnhance()
         node._progress_bar = _Bar
+        temp_directory = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(temp_directory, ignore_errors=True))
         folder_paths = types.ModuleType("folder_paths")
         folder_paths.models_dir = "/models"
+        folder_paths.get_temp_directory = lambda: str(temp_directory)
         torch_module = types.ModuleType("torch")
         torch_module.from_numpy = lambda array: array
+        import sys
+
         import my_nodes.nodes.video_enhance as node_module
 
-        with mock.patch.object(node_module, "prepare_frames", return_value=images), \
+        arguments = {
+            "enable_super_resolution": True,
+            "spatial_mode": "2.0x",
+            "enable_neural_rendering": False,
+            "nr_profile": "standard",
+            "nr_intensity": 1.0,
+            "enable_frame_interpolation": True,
+        }
+        arguments.update(enhance_kwargs)
+        with mock.patch.object(node_module, "prepare_frames", return_value=images.copy()), \
              mock.patch.object(node_module, "resolve_runtime_dir", return_value="/runtime"), \
-             mock.patch.object(node_module, "run_dlss_stage", side_effect=dlss), \
-             mock.patch.object(node_module, "interpolate_offline", side_effect=vfi), \
+             mock.patch.object(node_module, "run_frame_pipeline", side_effect=fake_pipeline), \
+             mock.patch("psutil.virtual_memory", return_value=types.SimpleNamespace(available=1 << 30)), \
              mock.patch.dict(sys.modules, {"folder_paths": folder_paths, "torch": torch_module}):
-            output, multiplier, status = node.enhance(
-                images, True, "2.0x", False, "standard", 1.0, True
-            )
-        self.assertEqual(output.shape[0], 3)
-        self.assertEqual(multiplier, 2)
-        self.assertIn("input FPS x2", status)
-        self.assertEqual(created, [3])
-        self.assertEqual(updates, [1, 2, 3])
+            output, multiplier, status = node.enhance(images, **arguments)
+        return types.SimpleNamespace(
+            call=calls[0],
+            output=output,
+            multiplier=multiplier,
+            status=status,
+            updates=updates,
+            temp_directory=str(temp_directory),
+        )
+
+    def test_the_shared_pipeline_gets_the_plan_spec_temp_dir_and_options(self) -> None:
+        result = self._pipeline_call(stage_order=STAGE_ORDER_DLSS_THEN_VFI)
+        call = result.call
+        self.assertEqual(call["spec"], FrameSpec(count=2, height=6, width=4))
+        self.assertEqual(call["plan"].stages, ("dlss", "vfi"))
+        self.assertEqual(np.asarray(call["source"]).shape, (2, 6, 4, 3))
+        # DLSS first: 2 frames, then one VFI pair, so the bar totals 3 steps.
+        self.assertEqual(call["created"], [3])
+        self.assertEqual(result.updates, [1, 2, 3])
+        # The two-stage run stages its intermediate frames on disk.
+        self.assertEqual(call["kwargs"]["temp_directory"], result.temp_directory)
+        options = call["kwargs"]
+        self.assertEqual(options["vfi"].precision, "fp32")
+        self.assertEqual(options["vfi"].models_dir, "/models")
+        self.assertEqual(options["vfi"].ds_factor, 1.0)
+        self.assertEqual(options["dlss"].runtime_dir, "/runtime")
+        self.assertEqual(options["dlss"].motion_mode, "optical_flow")
+        self.assertEqual(options["dlss"].channel_order, "auto")
+        self.assertIsNotNone(options["dlss"].memory_hooks)
+        from my_nodes.core.video_enhance.dlss_stage import comfy_interrupt
+
+        self.assertIs(options["interrupt"], comfy_interrupt)
+        # The output batch is the preallocated final IMAGE, written frame by frame.
+        self.assertEqual(result.output.shape, (3, 12, 8, 3))
+        self.assertEqual(result.multiplier, 2)
+        self.assertIn("dlss+vfi", result.status)
+        self.assertIn("SR 2.0x", result.status)
+        self.assertIn("channels=RGBA", result.status)
+        self.assertIn("frames=3", result.status)
+        self.assertIn("input FPS x2", result.status)
+        np.testing.assert_allclose(result.output[2], np.full((12, 8, 3), 2.0, dtype=np.float32))
+
+    def test_vfi_first_order_and_the_single_stage_path_are_wired_too(self) -> None:
+        result = self._pipeline_call(stage_order=STAGE_ORDER_VFI_THEN_DLSS)
+        self.assertEqual(result.call["plan"].stages, ("vfi", "dlss"))
+        # VFI first: 1 pair, then 3 DLSS frames, so the bar totals 4 steps.
+        self.assertEqual(result.call["created"], [4])
+        self.assertEqual(result.updates, [1, 2, 3, 4])
+        self.assertEqual(result.call["kwargs"]["temp_directory"], result.temp_directory)
+        self.assertEqual(result.output.shape, (3, 12, 8, 3))
+
+        single = self._pipeline_call(enable_super_resolution=False)
+        self.assertEqual(single.call["plan"].stages, ("vfi",))
+        self.assertEqual(single.call["created"], [1])
+        self.assertEqual(single.updates, [1])
+        # A single stage needs no disk-backed intermediate.
+        self.assertIsNone(single.call["kwargs"]["temp_directory"])
+        self.assertEqual(single.output.shape, (3, 6, 4, 3))
+        self.assertIn("frames=3", single.status)
+        self.assertIn("vfi", single.status)
+
+    def test_ram_preflight_rejects_an_output_that_would_exhaust_ram(self) -> None:
+        images = _batch(_frame(), _frame())
+        available = 4096
+        with mock.patch(
+            "psutil.virtual_memory", return_value=types.SimpleNamespace(available=available)
+        ), mock.patch("my_nodes.nodes.video_enhance.run_frame_pipeline") as pipeline:
+            with self.assertRaises(InsufficientRamError) as raised:
+                MyVideoEnhance().enhance(images, True, "2.0x", False, "standard", 1.0, True)
+        pipeline.assert_not_called()
+        # The final IMAGE is 3 frames of 12x8 float32: 3456 bytes.
+        message = str(raised.exception)
+        self.assertIn("3456", message)
+        self.assertIn(str(available), message)
+        self.assertIn(f"{OUTPUT_RAM_FRACTION:.0%}", message)
+        self.assertIn("MyVideoEnhanceStream", message)
+
+    def test_ram_preflight_reports_a_measurement_failure(self) -> None:
+        images = _batch(_frame(), _frame())
+        with mock.patch(
+            "psutil.virtual_memory", side_effect=OSError("no /proc/meminfo")
+        ):
+            with self.assertRaises(InsufficientRamError) as raised:
+                MyVideoEnhance().enhance(images, True, "2.0x", False, "standard", 1.0, True)
+        self.assertIn("no /proc/meminfo", str(raised.exception))
 
     def test_probe_requires_a_dlss_feature(self) -> None:
         with self.assertRaises(ValueError):
@@ -698,6 +915,9 @@ class NodeContractTests(unittest.TestCase):
         self.assertIn("enable_frame_interpolation", ids)
         advanced = [item.id for item in schema.inputs if getattr(item, "advanced", False)]
         self.assertIn("vfi_ds_factor", advanced)
+        # The new stage order is appended and advanced, like every other new knob.
+        self.assertEqual(ids[-1], "stage_order")
+        self.assertIn("stage_order", advanced)
         self.assertEqual([output.display_name for output in schema.outputs], ["images", "fps_multiplier", "status"])
         self.assertIsNotNone(io)
 

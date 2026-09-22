@@ -10,7 +10,7 @@ model manager loads it for the run and unloads it again on every exit path.
 from __future__ import annotations
 
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 
 import numpy as np
 
@@ -183,22 +183,105 @@ def interpolate_offline(
     progress: Callable[[int, int], None] | None = None,
     interrupt: Callable[[], None] | None = None,
 ) -> np.ndarray:
-    """Interpolate adjacent pairs one at a time. N source frames become 2*N-1.
+    """Collect `iter_interpolate_offline` for one in-memory batch. N frames become 2*N-1.
 
-    N=1 is returned unchanged and does not load the model. The patcher is
-    unloaded in `finally`, including when Comfy raises a BaseException.
+    The signature and the result are unchanged: this is the compatibility
+    collector over the incremental iterator, which owns pair assembly, the
+    model lifecycle and the frame-count contract.
     """
     if frames.ndim != 4 or frames.shape[-1] != 3 or frames.shape[0] < 1:
         raise GimmVfiError(f"VFI input must be [N,H,W,3], got shape {frames.shape}")
     count = int(frames.shape[0])
+    output = np.empty((2 * count - 1, frames.shape[1], frames.shape[2], 3), dtype=np.float32)
+    stream = iter_interpolate_offline(
+        frames,
+        count,
+        precision=precision,
+        ds_factor=ds_factor,
+        models_dir=models_dir,
+        node_mappings=node_mappings,
+        load_device=load_device,
+        memory_required=memory_required,
+        progress=progress,
+        interrupt=interrupt,
+    )
+    try:
+        for index, frame in enumerate(stream):
+            output[index] = frame
+    finally:
+        # Exhausted already on the normal path; this unloads the model when the
+        # collector is interrupted between two frames.
+        stream.close()
+    return output
+
+
+def _require_frame_count(frame_count: object) -> int:
+    if isinstance(frame_count, bool) or not isinstance(frame_count, int):
+        raise GimmVfiError(f"frame_count must be an int, got {type(frame_count).__name__}")
+    if frame_count < 1:
+        raise GimmVfiError(f"frame_count must be at least 1, got {frame_count}")
+    return frame_count
+
+
+def _next_frame(source, index: int, count: int) -> np.ndarray:
+    """Pull one staged `[H,W,3]` frame; an early end of the source is an error."""
+    try:
+        frame = next(source)
+    except StopIteration:
+        raise GimmVfiError(
+            f"VFI expected {count} frames but the source ended early at frame {index}"
+        ) from None
+    array = np.asarray(frame)
+    if array.ndim != 3 or array.shape[-1] != 3:
+        raise GimmVfiError(f"VFI frame {index} must be [H,W,3], got shape {array.shape}")
+    return np.ascontiguousarray(array, dtype=np.float32)
+
+
+def _require_exhausted(source, count: int) -> None:
+    try:
+        next(source)
+    except StopIteration:
+        return
+    raise GimmVfiError(f"VFI expected exactly {count} frames but the source produced more")
+
+
+def iter_interpolate_offline(
+    frames,
+    frame_count: int,
+    *,
+    precision: str,
+    ds_factor: float,
+    models_dir: str | os.PathLike[str],
+    node_mappings: dict | None = None,
+    load_device=None,
+    memory_required: int | None = None,
+    progress: Callable[[int, int], None] | None = None,
+    interrupt: Callable[[], None] | None = None,
+) -> Iterator[np.ndarray]:
+    """Interpolate adjacent pairs one at a time, yielding F0,M01,F1,...,F_last.
+
+    `frames` is an iterable of float32 `[H,W,3]` frames and `frame_count` its
+    exact length: a shorter or longer source is an error, never padded or
+    truncated. One frame is yielded unchanged and loads no model. The module and
+    the cuBLAS workspace are released in `finally`, so an exhausted generator, a
+    `GimmVfiError` and a `close()` from the caller all unload the same way.
+    """
+    count = _require_frame_count(frame_count)
+    source = iter(frames)
     if count == 1:
-        return np.ascontiguousarray(frames, dtype=np.float32)
-    if not np.isfinite(ds_factor) or not 0.01 <= float(ds_factor) <= 1.0:
+        frame = _next_frame(source, 0, count)
+        _require_exhausted(source, count)
+        yield frame
+        return
+    ds_factor = float(ds_factor)
+    if not np.isfinite(ds_factor) or not 0.01 <= ds_factor <= 1.0:
         raise GimmVfiError(f"vfi_ds_factor must be within [0.01, 1.0], got {ds_factor!r}")
+    left = _next_frame(source, 0, count)
 
     import comfy.model_management as mm
     import torch
 
+    pairs = count - 1
     device = load_device if load_device is not None else mm.get_torch_device()
     patcher = None
     try:
@@ -216,29 +299,31 @@ def interpolate_offline(
         _loader_cls, interpolator_cls = resolve_gimm_nodes(node_mappings)
         interpolator = interpolator_cls()
         required = patcher.model_size() if memory_required is None else int(memory_required)
-        output = np.empty((2 * count - 1, frames.shape[1], frames.shape[2], 3), dtype=np.float32)
-        pairs = count - 1
         mm.load_models_gpu([patcher], memory_required=required, force_full_load=True)
         module = patcher.model
-        with torch.inference_mode():
-            for index in range(pairs):
-                if interrupt is not None:
-                    interrupt()
+        for index in range(pairs):
+            if interrupt is not None:
+                interrupt()
+            right = _next_frame(source, index + 1, count)
+            # Inference mode must not span a yield: the caller's own work runs
+            # while this generator is suspended.
+            with torch.inference_mode():
                 produced = interpolator.interpolate(
                     module,
-                    _pair_batch(frames[index], frames[index + 1]),
-                    float(ds_factor),
+                    _pair_batch(left, right),
+                    ds_factor,
                     GIMM_FACTOR,
                     GIMM_SEED,
                     output_flows=False,
                 )
-                triple = _as_frames(produced)
-                output[index * 2] = triple[0]
-                output[index * 2 + 1] = triple[1]
-                if progress is not None:
-                    progress(index + 1, pairs)
-        output[-1] = np.ascontiguousarray(frames[-1], dtype=np.float32)
-        return output
+            triple = _as_frames(produced)
+            yield triple[0]
+            yield triple[1]
+            left = right
+            if progress is not None:
+                progress(index + 1, pairs)
+        _require_exhausted(source, count)
+        yield left
     finally:
         try:
             if patcher is not None:

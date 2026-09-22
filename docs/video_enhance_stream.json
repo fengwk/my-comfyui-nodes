@@ -1,0 +1,358 @@
+{
+  "id": "61150d15-88ac-4493-89de-f43f69a76b40",
+  "revision": 0,
+  "last_node_id": 3,
+  "last_link_id": 2,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "LoadVideo",
+      "pos": [
+        200,
+        260
+      ],
+      "size": [
+        300,
+        320
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "file",
+          "type": "COMBO",
+          "widget": {
+            "name": "file"
+          },
+          "link": null
+        },
+        {
+          "name": "upload",
+          "type": "IMAGEUPLOAD",
+          "widget": {
+            "name": "upload"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "VIDEO",
+          "type": "VIDEO",
+          "links": [
+            1
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadVideo",
+        "cnr_id": "comfy-core"
+      },
+      "widgets_values": [
+        "1.mp4",
+        "image"
+      ]
+    },
+    {
+      "id": 2,
+      "type": "MyVideoEnhanceStream",
+      "pos": [
+        580,
+        260
+      ],
+      "size": [
+        380,
+        560
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "link": 1
+        },
+        {
+          "name": "enable_super_resolution",
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "enable_super_resolution"
+          },
+          "link": null
+        },
+        {
+          "name": "spatial_mode",
+          "type": "COMBO",
+          "widget": {
+            "name": "spatial_mode"
+          },
+          "link": null
+        },
+        {
+          "name": "enable_neural_rendering",
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "enable_neural_rendering"
+          },
+          "link": null
+        },
+        {
+          "name": "nr_profile",
+          "type": "COMBO",
+          "widget": {
+            "name": "nr_profile"
+          },
+          "link": null
+        },
+        {
+          "name": "nr_intensity",
+          "type": "FLOAT",
+          "widget": {
+            "name": "nr_intensity"
+          },
+          "link": null
+        },
+        {
+          "name": "enable_frame_interpolation",
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "enable_frame_interpolation"
+          },
+          "link": null
+        },
+        {
+          "name": "output_codec",
+          "type": "COMBO",
+          "widget": {
+            "name": "output_codec"
+          },
+          "link": null
+        },
+        {
+          "name": "quality",
+          "type": "INT",
+          "widget": {
+            "name": "quality"
+          },
+          "link": null
+        },
+        {
+          "name": "vfi_precision",
+          "shape": 7,
+          "type": "COMBO",
+          "widget": {
+            "name": "vfi_precision"
+          },
+          "link": null
+        },
+        {
+          "name": "vfi_ds_factor",
+          "shape": 7,
+          "type": "FLOAT",
+          "widget": {
+            "name": "vfi_ds_factor"
+          },
+          "link": null
+        },
+        {
+          "name": "motion",
+          "shape": 7,
+          "type": "COMBO",
+          "widget": {
+            "name": "motion"
+          },
+          "link": null
+        },
+        {
+          "name": "scene_cut_threshold",
+          "shape": 7,
+          "type": "FLOAT",
+          "widget": {
+            "name": "scene_cut_threshold"
+          },
+          "link": null
+        },
+        {
+          "name": "channel_order",
+          "shape": 7,
+          "type": "COMBO",
+          "widget": {
+            "name": "channel_order"
+          },
+          "link": null
+        },
+        {
+          "name": "runtime_dir",
+          "shape": 7,
+          "type": "STRING",
+          "widget": {
+            "name": "runtime_dir"
+          },
+          "link": null
+        },
+        {
+          "name": "wine_prefix",
+          "shape": 7,
+          "type": "STRING",
+          "widget": {
+            "name": "wine_prefix"
+          },
+          "link": null
+        },
+        {
+          "name": "worker_timeout",
+          "shape": 7,
+          "type": "FLOAT",
+          "widget": {
+            "name": "worker_timeout"
+          },
+          "link": null
+        },
+        {
+          "name": "stage_order",
+          "shape": 7,
+          "type": "COMBO",
+          "widget": {
+            "name": "stage_order"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "links": [
+            2
+          ]
+        },
+        {
+          "name": "interpolation_multiplier",
+          "type": "INT",
+          "links": null
+        },
+        {
+          "name": "status",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "MyVideoEnhanceStream"
+      },
+      "widgets_values": [
+        true,
+        "2.0x",
+        false,
+        "standard",
+        1.0,
+        true,
+        "libx264",
+        18,
+        "fp16",
+        1.0,
+        "optical_flow",
+        0.2,
+        "auto",
+        "",
+        "",
+        600.0,
+        "vfi_then_dlss"
+      ]
+    },
+    {
+      "id": 3,
+      "type": "SaveVideo",
+      "pos": [
+        1040,
+        260
+      ],
+      "size": [
+        320,
+        320
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "link": 2
+        },
+        {
+          "name": "filename_prefix",
+          "type": "STRING",
+          "widget": {
+            "name": "filename_prefix"
+          },
+          "link": null
+        },
+        {
+          "name": "format",
+          "type": "COMBO",
+          "widget": {
+            "name": "format"
+          },
+          "link": null
+        },
+        {
+          "name": "codec",
+          "type": "COMBO",
+          "widget": {
+            "name": "codec"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SaveVideo",
+        "cnr_id": "comfy-core"
+      },
+      "widgets_values": [
+        "video/enhanced_stream",
+        "mkv",
+        "auto"
+      ]
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      2,
+      0,
+      "VIDEO"
+    ],
+    [
+      2,
+      2,
+      0,
+      3,
+      0,
+      "VIDEO"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 1.0,
+      "offset": [
+        0,
+        0
+      ]
+    }
+  },
+  "version": 0.4
+}

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import math
 import os
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 
 import numpy as np
@@ -76,10 +76,27 @@ def build_header(
     frames: np.ndarray,
     settings: NeuralRenderingSettings | None = None,
 ) -> dnr3.Header:
-    """Build the one DNR3 header for this batch. Header validation checks the scale."""
+    """Build the one DNR3 header for an in-memory batch; header validation checks the scale."""
+    return build_header_for(
+        plan,
+        count=int(frames.shape[0]),
+        height=int(frames.shape[1]),
+        width=int(frames.shape[2]),
+        settings=settings,
+    )
+
+
+def build_header_for(
+    plan: VideoEnhancePlan,
+    *,
+    count: int,
+    height: int,
+    width: int,
+    settings: NeuralRenderingSettings | None = None,
+) -> dnr3.Header:
+    """Build the header for one frame spec, without staging the frames themselves."""
     if not plan.uses_dlss:
         raise FrameValidationError("refusing to build a DLSS header when both DLSS features are off")
-    count, height, width = (int(frames.shape[0]), int(frames.shape[1]), int(frames.shape[2]))
     features = 0
     if plan.enable_super_resolution:
         features |= FEATURE_SR
@@ -133,6 +150,155 @@ def resolve_runtime_dir(
     return selected
 
 
+def _source_frame(source: Iterator[np.ndarray], index: int, header: dnr3.Header) -> np.ndarray:
+    """Pull the next input frame; validate it before the worker sees any data."""
+    try:
+        frame = next(source)
+    except StopIteration:
+        raise FrameValidationError(
+            f"DLSS stage expected {header.frame_count} frames but the input ended early at frame {index}"
+        ) from None
+    array = np.asarray(frame)
+    if array.dtype != np.float32 or array.shape != (header.input_height, header.input_width, 3):
+        raise FrameValidationError(
+            f"DLSS stage frame {index} must be float32 "
+            f"{(header.input_height, header.input_width, 3)}, got {array.dtype} {array.shape}"
+        )
+    if not np.isfinite(array).all():
+        raise FrameValidationError(f"DLSS stage frame {index} contains non-finite values")
+    return array
+
+
+def _require_exhausted(source: Iterator[np.ndarray], count: int) -> None:
+    try:
+        next(source)
+    except StopIteration:
+        return
+    raise FrameValidationError(
+        f"DLSS stage expected exactly {count} frames but the input produced more"
+    )
+
+
+class DlssStageStream:
+    """One DLSS stage over an iterable of frames: one worker, one guide chain.
+
+    The stream is a context manager. `__enter__` validates the runtime, frees
+    Comfy memory and starts exactly one `Dnr3Worker` for the whole stage;
+    `__exit__` always reaps that worker, including on a ComfyUI BaseException
+    interrupt and on an abandoned iteration. Iterating yields one corrected
+    float32 frame per input frame, in order, and refuses a source that is
+    shorter or longer than `count` instead of padding or truncating it.
+
+    `channel_order` is the resolved order: an explicit order is kept, `auto`
+    is decided by the first input/output pair and then reused for the stage.
+    """
+
+    def __init__(
+        self,
+        plan: VideoEnhancePlan,
+        source: Iterable[np.ndarray],
+        *,
+        count: int,
+        height: int,
+        width: int,
+        runtime_dir: str,
+        wine_prefix: str,
+        channel_order: str,
+        motion_mode: str,
+        scene_cut_threshold: float,
+        timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        progress: Callable[[int, int], None] | None = None,
+        interrupt: Callable[[], object] | None = None,
+        driver_factory: Callable[..., HostDriver] | None = None,
+        memory_hooks: tuple[Callable[[], None], Callable[[], None]] | None = None,
+    ) -> None:
+        self._header = build_header_for(plan, count=count, height=height, width=width)
+        self._source = source
+        self._runtime_dir = runtime_dir
+        self._wine_prefix = wine_prefix
+        self._channel_order: str | None = None if channel_order == "auto" else channel_order
+        self._motion_mode = motion_mode
+        self._scene_cut_threshold = scene_cut_threshold
+        self._timeout = timeout
+        self._progress = progress
+        self._interrupt = interrupt
+        self._driver_factory = driver_factory
+        self._memory_hooks = memory_hooks
+        self._guides: motion_guides.MotionGuides | None = None
+        self._worker: Dnr3Worker | None = None
+
+    @property
+    def header(self) -> dnr3.Header:
+        """The validated header of this stage; it declares the output dimensions."""
+        return self._header
+
+    @property
+    def features(self) -> int:
+        return self._header.features
+
+    @property
+    def output_width(self) -> int:
+        return self._header.output_width
+
+    @property
+    def output_height(self) -> int:
+        return self._header.output_height
+
+    @property
+    def channel_order(self) -> str | None:
+        """Resolved channel order, or None while `auto` has not seen a frame yet."""
+        return self._channel_order
+
+    def __enter__(self) -> DlssStageStream:
+        guides = motion_guides.MotionGuides(self._motion_mode, self._scene_cut_threshold)
+        if self._motion_mode == motion_guides.MOTION_OPTICAL_FLOW:
+            # Import before Wine starts. A one-frame preflight would miss this,
+            # because the first frame is a reset and does not call OpenCV.
+            motion_guides._import_cv2()
+        if self._memory_hooks is not None:
+            free_memory, empty_cache = self._memory_hooks
+            free_memory()
+            empty_cache()
+        factory = self._driver_factory if self._driver_factory is not None else HostDriver.wine
+        prefix = self._wine_prefix.strip() or None
+        worker = Dnr3Worker(
+            self._header,
+            driver=factory(
+                runtime_dir=self._runtime_dir, features=self._header.features, wine_prefix=prefix
+            ),
+            timeout=self._timeout,
+            interrupt=self._interrupt,
+        )
+        worker.__enter__()
+        self._guides = guides
+        self._worker = worker
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> bool:
+        worker, self._worker = self._worker, None
+        if worker is None:
+            return False
+        return worker.__exit__(exc_type, exc, traceback)
+
+    def __iter__(self) -> Iterator[np.ndarray]:
+        if self._worker is None or self._guides is None:
+            raise FrameValidationError("the DLSS stage stream must be entered before it is iterated")
+        worker = self._worker
+        guides = self._guides
+        header = self._header
+        source = iter(self._source)
+        for index in range(header.frame_count):
+            frame = _source_frame(source, index, header)
+            guide = guides.guide(frame)
+            produced = worker.enhance(frame, guide.motion, reset=guide.reset)
+            if self._channel_order is None:
+                self._channel_order = select_channel_order("auto", frame, produced)
+            if self._progress is not None:
+                self._progress(index + 1, header.frame_count)
+            yield apply_channel_order(produced, self._channel_order)
+        _require_exhausted(source, header.frame_count)
+
+
 def run_dlss_stage(
     plan: VideoEnhancePlan,
     frames: np.ndarray,
@@ -148,43 +314,41 @@ def run_dlss_stage(
     driver_factory: Callable[..., HostDriver] | None = None,
     memory_hooks: tuple[Callable[[], None], Callable[[], None]] | None = None,
 ) -> DlssStageResult:
-    """Run feature 1 and optional feature 18 in one scoped worker, then close it.
+    """Collect `DlssStageStream` for one in-memory batch. Signature and result unchanged.
 
     `frames` must already be the contiguous CPU copy from `prepare_frames`.
     Memory hooks run after that copy exists and before the worker is spawned.
     """
     header = build_header(plan, frames)
-    guides = motion_guides.MotionGuides(motion_mode, scene_cut_threshold)
-    if motion_mode == motion_guides.MOTION_OPTICAL_FLOW:
-        # Import before Wine starts. A one-frame preflight would miss this,
-        # because the first frame is a reset and does not call OpenCV.
-        motion_guides._import_cv2()
-    if memory_hooks is not None:
-        free_memory, empty_cache = memory_hooks
-        free_memory()
-        empty_cache()
-    factory = driver_factory if driver_factory is not None else HostDriver.wine
-    prefix = wine_prefix.strip() or None
-    driver = factory(runtime_dir=runtime_dir, features=header.features, wine_prefix=prefix)
     output = np.empty(
         (header.frame_count, header.output_height, header.output_width, 3), dtype=np.float32
     )
-    resolved_order: str | None = None if channel_order == "auto" else channel_order
-    with Dnr3Worker(header, driver=driver, timeout=timeout, interrupt=interrupt) as worker:
-        for index in range(header.frame_count):
-            guide = guides.guide(frames[index])
-            produced = worker.enhance(frames[index], guide.motion, reset=guide.reset)
-            if resolved_order is None:
-                resolved_order = select_channel_order("auto", frames[index], produced)
-            output[index] = apply_channel_order(produced, resolved_order)
-            if progress is not None:
-                progress(index + 1, header.frame_count)
-    assert resolved_order is not None
+    stream = DlssStageStream(
+        plan,
+        frames,
+        count=header.frame_count,
+        height=header.input_height,
+        width=header.input_width,
+        runtime_dir=runtime_dir,
+        wine_prefix=wine_prefix,
+        channel_order=channel_order,
+        motion_mode=motion_mode,
+        scene_cut_threshold=scene_cut_threshold,
+        timeout=timeout,
+        progress=progress,
+        interrupt=interrupt,
+        driver_factory=driver_factory,
+        memory_hooks=memory_hooks,
+    )
+    with stream:
+        for index, frame in enumerate(stream):
+            output[index] = frame
+    assert stream.channel_order is not None
     return DlssStageResult(
         frames=output,
         output_width=header.output_width,
         output_height=header.output_height,
-        channel_order=resolved_order,
+        channel_order=stream.channel_order,
         features=header.features,
     )
 

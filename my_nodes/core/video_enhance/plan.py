@@ -20,6 +20,12 @@ NR_INTENSITY_RANGE: tuple[float, float] = (0.0, 2.0)
 STAGE_DLSS: str = "dlss"
 STAGE_VFI: str = "vfi"
 
+# Explicit order of the two stages when both are active. Only the combined run
+# is ambiguous; a single active stage keeps its own behavior either way.
+STAGE_ORDER_DLSS_THEN_VFI: str = "dlss_then_vfi"
+STAGE_ORDER_VFI_THEN_DLSS: str = "vfi_then_dlss"
+STAGE_ORDERS: tuple[str, ...] = (STAGE_ORDER_DLSS_THEN_VFI, STAGE_ORDER_VFI_THEN_DLSS)
+
 
 def _require_bool(value: object, name: str) -> bool:
     if not isinstance(value, bool):
@@ -57,8 +63,11 @@ class VideoEnhancePlan:
     the worker. A disabled stage is only excluded from `stages`, so it never
     causes backend startup.
 
-    `stages` is the deterministic execution order: the DLSS stage runs whenever
-    super resolution or neural rendering is enabled, then frame interpolation.
+    `stages` is the deterministic execution order. `stage_order` only chooses
+    between the two combinations of both stages: the legacy default runs DLSS
+    (super resolution and neural rendering) first and interpolates its output,
+    the alternative interpolates first and enhances the interpolated frames.
+    When a single stage is active its order is not ambiguous and unchanged.
     """
 
     enable_super_resolution: bool = False
@@ -68,6 +77,7 @@ class VideoEnhancePlan:
     nr_intensity: float = 1.0
     enable_frame_interpolation: bool = False
     interpolation_factor: int = 2
+    stage_order: str = STAGE_ORDER_DLSS_THEN_VFI
 
     def __post_init__(self) -> None:
         _require_bool(self.enable_super_resolution, "enable_super_resolution")
@@ -89,9 +99,13 @@ class VideoEnhancePlan:
             raise ValueError(
                 f"interpolation_factor must be one of {INTERPOLATION_FACTORS}, got {factor!r}"
             )
+        order = _require_str(self.stage_order, "stage_order")
+        if order not in STAGE_ORDERS:
+            raise ValueError(f"stage_order must be one of {STAGE_ORDERS}, got {order!r}")
         # Normalize numbers so equal settings always produce equal plans.
         object.__setattr__(self, "sr_scale", scale)
         object.__setattr__(self, "nr_intensity", intensity)
+        object.__setattr__(self, "stage_order", order)
 
     @property
     def uses_dlss(self) -> bool:
@@ -104,14 +118,22 @@ class VideoEnhancePlan:
         return self.enable_frame_interpolation
 
     @property
+    def uses_both_stages(self) -> bool:
+        """True when `stage_order` decides between two active stages."""
+        return self.uses_dlss and self.uses_frame_interpolation
+
+    @property
     def stages(self) -> tuple[str, ...]:
         """Deterministic stage order for this execution; empty when all off."""
-        stages: list[str] = []
+        if self.uses_both_stages:
+            if self.stage_order == STAGE_ORDER_VFI_THEN_DLSS:
+                return (STAGE_VFI, STAGE_DLSS)
+            return (STAGE_DLSS, STAGE_VFI)
         if self.uses_dlss:
-            stages.append(STAGE_DLSS)
-        if self.enable_frame_interpolation:
-            stages.append(STAGE_VFI)
-        return tuple(stages)
+            return (STAGE_DLSS,)
+        if self.uses_frame_interpolation:
+            return (STAGE_VFI,)
+        return ()
 
     @property
     def is_pass_through(self) -> bool:

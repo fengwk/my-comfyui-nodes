@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import subprocess
 import sys
+import time
 import unittest
+from typing import Any
+from unittest import mock
 
 from my_nodes.core.video_enhance import ProcessError, ProcessInterrupted, ProcessIOError, ScopedProcess
 from my_nodes.core.video_enhance.scoped_process import ProcessTimeout
@@ -63,6 +67,32 @@ for index in range(400):
     print(f"line {index:04d} " + "x" * 32, file=sys.stderr)
 sys.stderr.flush()
 time.sleep(1)
+"""
+# More than a pipe holds (64 KiB), so it only reaches the exit while drained.
+FLOOD_SIZE = 256 * 1024
+FLOOD_STDERR_THEN_EXIT = f"""
+import os, sys
+sys.stdout.buffer.flush()
+os.close(1)
+line = b"noise " + b"y" * 57
+written = 0
+while written < {FLOOD_SIZE}:
+    sys.stderr.buffer.write(line)
+    written += len(line)
+sys.stderr.buffer.write(b"END-OF-FLOOD")
+sys.stderr.buffer.flush()
+"""
+FLOOD_STDERR_FOREVER = """
+import os, sys
+sys.stdout.buffer.flush()
+os.close(1)
+line = b"noise " + b"y" * 57
+while True:
+    try:
+        sys.stderr.buffer.write(line)
+        sys.stderr.buffer.flush()
+    except OSError:
+        break
 """
 GRANDCHILD_MARKER = "grandchild "
 
@@ -203,6 +233,70 @@ class FailureTests(ScopedProcessTestCase):
         self.assertIn("line 0399", text)
 
 
+class DrainingWaitTests(ScopedProcessTestCase):
+    """`wait_exit_draining` is the wait that cannot deadlock on a full pipe."""
+
+    def test_it_reaches_the_exit_through_a_stderr_flood(self) -> None:
+        # The child closes stdout, then writes four pipe buffers of stderr and
+        # exits. A plain wait_exit would never see that exit.
+        process = self.spawn(FLOOD_STDERR_THEN_EXIT, timeout=20.0)
+
+        with process:
+            self.assertTrue(process.wait_exit_draining(20.0, what="flooding child"))
+            self.assertFalse(process.is_alive())
+            self.assertEqual(process.returncode, 0)
+            text = process.stderr_text()
+            # The tail survived and capture stayed bounded: the flood is never
+            # accumulated in the parent.
+            self.assertIn("END-OF-FLOOD", text)
+            self.assertLessEqual(len(text), 8192 + 4)
+            self.assertLess(len(text), FLOOD_SIZE)
+
+    def test_it_drains_stdout_as_well(self) -> None:
+        # 4 MiB on stdout with nobody reading it: the wait has to take it off the
+        # pipe for the child to reach its exit.
+        process = self.spawn(FLOOD_STDOUT, timeout=20.0)
+
+        with process:
+            self.assertTrue(process.wait_exit_draining(20.0, what="noisy child"))
+            self.assertEqual(process.returncode, 0)
+
+    def test_it_is_bounded_by_its_deadline(self) -> None:
+        process = self.spawn(FLOOD_STDERR_FOREVER, timeout=60.0)
+
+        with process:
+            started = time.monotonic()
+            self.assertFalse(process.wait_exit_draining(0.5, what="flooding child"))
+            self.assertLess(time.monotonic() - started, 10.0)
+            self.assertTrue(process.is_alive())
+
+    def test_it_polls_the_interrupt_callback_while_draining(self) -> None:
+        calls: list[int] = []
+
+        def interrupt() -> bool:
+            calls.append(1)
+            return True
+
+        process = self.spawn(
+            FLOOD_STDERR_FOREVER, timeout=60.0, interrupt=interrupt, poll_interval=0.02
+        )
+
+        with process:
+            with self.assertRaises(ProcessInterrupted):
+                process.wait_exit_draining(30.0, what="flooding child")
+
+        self.assertTrue(calls)
+        self.assertFalse(process.is_alive())
+        assert_process_gone(process.pid)
+
+    def test_it_returns_immediately_for_an_already_reaped_child(self) -> None:
+        process = self.spawn("pass", timeout=5.0)
+        with process:
+            pass
+
+        self.assertTrue(process.wait_exit_draining(5.0, what="finished child"))
+
+
 class CleanupTests(ScopedProcessTestCase):
     def test_body_exception_still_kills_and_reaps_the_child(self) -> None:
         process = self.spawn(SILENT_FOREVER, timeout=5.0)
@@ -270,6 +364,26 @@ class CleanupTests(ScopedProcessTestCase):
         process.close()
         process.terminate()
         self.assertIsNone(process.pid)
+
+    def test_setup_failure_after_spawn_reaps_the_child(self) -> None:
+        spawned: list[Any] = []
+        real_popen = subprocess.Popen
+
+        def recording_popen(*args: Any, **kwargs: Any) -> Any:
+            process = real_popen(*args, **kwargs)
+            spawned.append(process)
+            return process
+
+        # os.set_blocking runs right after Popen, i.e. in the window where the
+        # child exists but nothing else knows about it yet.
+        with mock.patch("subprocess.Popen", recording_popen), mock.patch(
+            "os.set_blocking", side_effect=KeyboardInterrupt("cancel during setup")
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                self.spawn(SILENT_FOREVER, timeout=5.0).__enter__()
+
+        self.assertEqual(len(spawned), 1)
+        assert_process_gone(spawned[0].pid)
 
     def test_spawn_failure_is_actionable(self) -> None:
         with self.assertRaises(ProcessError) as raised:
