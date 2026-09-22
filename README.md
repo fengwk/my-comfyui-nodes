@@ -102,11 +102,47 @@ ModelAttentionBackend 已有的 attention。
 
 N 帧插值后是 `2*N-1` 帧。`fps_multiplier` 只在插值真正跑过时为 2，编码时用输入 FPS 的 2 倍。单帧和关闭插值都是 1。
 
-运行时目录：节点上的 `runtime_dir`，否则 `DLSS5_RUNTIME_DIR`，否则 `<ComfyUI>/models/dlss5`。这里放你自己准备的 NVIDIA DLL（`_nvngx.dll`，超分还要 `nvngx_dlss.dll`，神经渲染还要 `nvngx_dlssnr.dll` 或 `nvngx_dlssnr_rtx30.dll`）。本仓库只带开源的 DNR3 host/bridge/shim，不下载、不附带 NVIDIA 二进制。Wine 前缀（`wine_prefix` → `DLSS5_WINEPREFIX` → `WINEPREFIX` → `~/.wine`）里必须已经有 `drive_c/windows/system32/d3d12.dll`（vkd3d-proton）和 `nvapi64.dll`（dxvk-nvapi）。
+#### DLSS 运行时与 Wine 依赖配置指南
 
-神经渲染在 RTX 3090 / 当前驱动上的兼容性没有保证。RTX 3090 不能使用 DLSS Frame Generation；本节点的插帧是另一条离线路径。
+本节点通过独立的 Wine 隔离子进程调用 NVIDIA Windows 原生 NGX 运行时。本仓库不分发闭源专有文件，需要配置以下运行环境：
 
-GIMM-VFI 使用已安装的 `ComfyUI-GIMM-VFI`（`custom_nodes/ComfyUI-GIMM-VFI`），不复制它的实现。权重是 `models/interpolation/gimm-vfi/gimmvfi_r_arb_lpips_fp32.safetensors` 和同目录的 `raft-things_fp32.safetensors`。该插件及其模型受 S-Lab 非商业许可约束，本仓库不转授权。真实 NGX 运行没有在这里验证。
+##### 1. NVIDIA 运行时 DLL 目录（`<ComfyUI>/models/dlss5/`）
+将以下 DLL 放置在 `<ComfyUI>/models/dlss5/`（或在节点的 `runtime_dir` 填写绝对路径）：
+- `_nvngx.dll` & `nvngx.dll`：NVIDIA 驱动 NGX 核心。Linux 系统安装官方驱动后可直接从 `/usr/lib/nvidia/wine/` 获取：
+  ```bash
+  mkdir -p models/dlss5
+  cp /usr/lib/nvidia/wine/_nvngx.dll /usr/lib/nvidia/wine/nvngx.dll models/dlss5/
+  ```
+- `nvngx_dlss.dll`：DLSS 超分辨率（Super Resolution / DLAA）官方运行库（可从 NVIDIA 官方 DLSS SDK 或 Windows 游戏安装目录获取）。
+- `nvngx_dlssnr.dll`（可选）：DLSS 神经渲染（Neural Rendering）实验性库。
+
+##### 2. Wine 前缀与 Direct3D 12 运行库（`~/.wine`）
+默认使用 `~/.wine`（或在节点的 `wine_prefix` 填写自定义前缀）。子进程通过 D3D12 调用 GPU，必须将以下 64 位 DLL 部署到 `drive_c/windows/system32/`：
+- `d3d12.dll` & `d3d12core.dll`：来自 [vkd3d-proton](https://github.com/HansKristian-Work/vkd3d-proton)（注意：两者必须同时存在，现代 vkd3d-proton 依赖 `d3d12core.dll` 提供 Agility 核心接口）。
+- `nvapi64.dll`：来自 [dxvk-nvapi](https://github.com/jp7677/dxvk-nvapi)。
+- `dxgi.dll`：来自 [dxvk](https://github.com/doitsujin/dxvk)。
+
+*若系统安装了 Steam Proton（如 Proton Experimental），可一键提取现成的 64 位组件：*
+```bash
+wineboot -u
+PFX_SYS32="$HOME/.wine/drive_c/windows/system32"
+PROTON_FILES="$HOME/.local/share/Steam/steamapps/common/Proton - Experimental/files"
+
+cp "$PROTON_FILES/lib/wine/vkd3d-proton/x86_64-windows/d3d12.dll" "$PFX_SYS32/"
+cp "$PROTON_FILES/lib/wine/vkd3d-proton/x86_64-windows/d3d12core.dll" "$PFX_SYS32/"
+cp "$PROTON_FILES/lib/wine/nvapi/x86_64-windows/nvapi64.dll" "$PFX_SYS32/"
+cp "$PROTON_FILES/lib/wine/dxvk/x86_64-windows/dxgi.dll" "$PFX_SYS32/"
+```
+
+##### 3. 硬件与驱动兼容性注意事项
+- **DLSS-SR（超分辨率 / DLAA 1.0x / 1.5x / 2.0x / 3.0x）**：
+  - 支持 RTX 20/30/40 全系列 GPU。
+  - 在 Linux + RTX 3090 + NVIDIA 驱动（已验证 610.57+）下已全面测试通过，运行稳定流畅。
+- **DLSS-NR（神经渲染 Feature 18）**：
+  - 属于实验性功能，底层调度要求 NVIDIA 驱动版本 ≥ 616.56。在低于 616.56 的驱动上执行可能会因 GPU fence 同步挂起超时。若当前系统驱动未满足要求，请保持 `enable_neural_rendering: false`。
+- **插帧（VFI）**：
+  - RTX 3090 硬件不支持 DLSS 3 Frame Generation（仅 RTX 40+ 支持）。本节点内置了基于 S-Lab GIMM-VFI 的纯离线高质量光流补帧，在 Wine 进程退出后独立执行，不受 DLSS 硬件代际限制。
+  - 权重位于 `models/interpolation/gimm-vfi/gimmvfi_r_arb_lpips_fp32.safetensors` 和 `raft-things_fp32.safetensors`。
 
 ### My DLSS Runtime Probe
 
