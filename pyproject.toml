@@ -16,6 +16,12 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 include = ["my_nodes*"]
 
+# The vendored DNR3 native sources, its MinGW build script and - once built -
+# the Windows artifacts (host exe, bridge DLL, caller shim) ship with the
+# package. NVIDIA runtime DLLs are never part of the package.
+[tool.setuptools.package-data]
+"my_nodes.core.video_enhance" = ["native/*", "native/**/*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]

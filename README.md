@@ -87,6 +87,31 @@ ModelAttentionBackend 已有的 attention。
 | `tau_profile` | STRING | 空 | 逐 block tau，如 `39-42=0.9` |
 | `dense_blocks` | STRING | 空 | 保持 dense 的 block，如 `0-2,-1` |
 
+### My Video Enhance
+
+三个开关独立，顺序固定：DLSS feature 1（DLAA / 超分）→ 可选 feature 18 神经渲染（同一个 Wine worker）→ worker 退出后，可选离线 GIMM-VFI 2x。关掉的阶段不会被调用；打开但缺文件时直接报路径，没有静默回退。
+
+| 输入 | 默认 | 含义 |
+|---|---|---|
+| `enable_super_resolution` | false | feature 1。`1.0 DLAA (native)` 是原生分辨率抗锯齿，不是放大 |
+| `spatial_mode` | `2.0x` | `1.0 DLAA (native)` / `1.5x` / `2.0x` / `3.0x` |
+| `enable_neural_rendering` | false | feature 18，实验性。`light/standard/portrait/detail` 是本节点的 UX 映射，不是 NVIDIA 官方预设 |
+| `enable_frame_interpolation` | false | 离线 GIMM-VFI-R，固定 2 倍。不是 DLSS Frame Generation |
+| `vfi_precision` / `vfi_ds_factor` | `fp32` / `1.0` | 高级项。权重必须已在磁盘上，节点不会下载 |
+| `motion` / `scene_cut_threshold` | `optical_flow` / `0.2` | 高级项。DIS 估计当前帧到前一帧的反向像素光流；切镜时重置时序历史 |
+
+N 帧插值后是 `2*N-1` 帧。`fps_multiplier` 只在插值真正跑过时为 2，编码时用输入 FPS 的 2 倍。单帧和关闭插值都是 1。
+
+运行时目录：节点上的 `runtime_dir`，否则 `DLSS5_RUNTIME_DIR`，否则 `<ComfyUI>/models/dlss5`。这里放你自己准备的 NVIDIA DLL（`_nvngx.dll`，超分还要 `nvngx_dlss.dll`，神经渲染还要 `nvngx_dlssnr.dll` 或 `nvngx_dlssnr_rtx30.dll`）。本仓库只带开源的 DNR3 host/bridge/shim，不下载、不附带 NVIDIA 二进制。Wine 前缀（`wine_prefix` → `DLSS5_WINEPREFIX` → `WINEPREFIX` → `~/.wine`）里必须已经有 `drive_c/windows/system32/d3d12.dll`（vkd3d-proton）和 `nvapi64.dll`（dxvk-nvapi）。
+
+神经渲染在 RTX 3090 / 当前驱动上的兼容性没有保证。RTX 3090 不能使用 DLSS Frame Generation；本节点的插帧是另一条离线路径。
+
+GIMM-VFI 使用已安装的 `ComfyUI-GIMM-VFI`（`custom_nodes/ComfyUI-GIMM-VFI`），不复制它的实现。权重是 `models/interpolation/gimm-vfi/gimmvfi_r_arb_lpips_fp32.safetensors` 和同目录的 `raft-things_fp32.safetensors`。该插件及其模型受 S-Lab 非商业许可约束，本仓库不转授权。真实 NGX 运行没有在这里验证。
+
+### My DLSS Runtime Probe
+
+用同一条 DNR3 管线跑一帧 32×32 的确定性 RGB，只返回状态字符串。至少打开 DLAA/超分或神经渲染。缺 DLL 或缺 Wine 前缀文件时，错误里会写出缺失路径。
+
 ## 加新节点
 
 1. 无 Comfy 依赖的算法放 `my_nodes/core/<name>.py`。

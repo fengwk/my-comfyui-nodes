@@ -37,6 +37,12 @@ except ImportError as exc:
 if SelfLiftH3Sampler is not None:
     NODE_CLASSES = NODE_CLASSES + (SelfLiftH3Sampler,)
 
+# Video enhance stays importable without torch/Comfy/GIMM. Registration itself
+# must not start a backend; the node imports those only when a stage is enabled.
+from my_nodes.nodes.video_enhance import MyDLSSRuntimeProbe, MyVideoEnhance
+
+NODE_CLASSES = NODE_CLASSES + (MyVideoEnhance, MyDLSSRuntimeProbe)
+
 
 def _node_id(cls):
     if hasattr(cls, "NODE_ID"):
