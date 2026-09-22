@@ -36,6 +36,7 @@ from my_nodes.core.video_enhance.gimm_vfi import (
     GimmVfiError,
     _clear_cublas_workspaces,
     _clear_gimm_backwarp_cache,
+    _quiet_interpolate_method,
     clear_patcher_cache,
     interpolate_offline,
     iter_interpolate_offline,
@@ -626,6 +627,161 @@ class GimmLifecycleTests(unittest.TestCase):
         self.assertEqual(str(next(memory.unloaded[0].model.parameters()).device), "cpu")
         self.assertTrue(memory.loaded[0][1])
 
+    def test_plugin_progress_is_call_local_while_original_method_stays_noisy(self) -> None:
+        # This models the installed method's ProgressBar/tqdm globals. A concurrent
+        # original invocation proves those globals remain noisy even while the
+        # production call path is using its quiet clone.
+        import threading
+
+        import torch
+
+        progress_events: list[tuple[str, int]] = []
+        tqdm_calls: list[bool] = []
+        globals_intact: list[bool] = []
+        bindings: list[tuple[object, object, object, bool]] = []
+        closure_value = object()
+        positional_default = object()
+        keyword_default = object()
+
+        class _NoisyProgressBar:
+            def __init__(self, total) -> None:
+                progress_events.append(("init", int(total)))
+
+            def update(self, amount) -> None:
+                progress_events.append(("update", int(amount)))
+
+        def noisy_tqdm(iterable, *_args, disable=False, **_kwargs):
+            tqdm_calls.append(bool(disable))
+            return iterable
+
+        def make_template(captured):
+            def interpolate(
+                self,
+                module,
+                images,
+                ds_factor,
+                interpolation_factor,
+                seed,
+                output_flows=False,
+                tag=positional_default,
+                *,
+                token=keyword_default,
+            ):
+                del module, ds_factor, seed
+                bindings.append((captured, tag, token, self.invoke_original))
+                pbar = ProgressBar(images.shape[0] - 1)  # noqa: F821
+                if self.invoke_original:
+                    invoke_original(images, interpolation_factor, output_flows)  # noqa: F821
+                for _index in tqdm(range(images.shape[0] - 1)):  # noqa: F821
+                    pbar.update(1)
+                left, right = images
+                return (torch.stack((left, (left + right) / 2, right)), torch.zeros(1))
+
+            return interpolate
+
+        template = make_template(closure_value)
+        plugin_globals = template.__globals__.copy()
+        plugin_globals.update(ProgressBar=_NoisyProgressBar, tqdm=noisy_tqdm)
+        plugin_function = types.FunctionType(
+            template.__code__,
+            plugin_globals,
+            name=template.__name__,
+            argdefs=template.__defaults__,
+            closure=template.__closure__,
+        )
+        plugin_function.__kwdefaults__ = template.__kwdefaults__
+        plugin_function.__annotations__ = template.__annotations__
+        metadata = object()
+        plugin_function.test_metadata = metadata
+        thread_errors: list[BaseException] = []
+
+        class _NoisyInterpolator:
+            interpolate = plugin_function
+
+            def __init__(self) -> None:
+                self.invoke_original = True
+
+        def invoke_original(images, factor, output_flows) -> None:
+            def run() -> None:
+                try:
+                    globals_intact.append(
+                        plugin_function.__globals__ is plugin_globals
+                        and plugin_globals["ProgressBar"] is _NoisyProgressBar
+                        and plugin_globals["tqdm"] is noisy_tqdm
+                    )
+                    standalone = _NoisyInterpolator()
+                    standalone.invoke_original = False
+                    standalone.interpolate(
+                        object(), images, 1.0, factor, 0, output_flows=output_flows
+                    )
+                except BaseException as exc:
+                    thread_errors.append(exc)
+
+            thread = threading.Thread(target=run)
+            thread.start()
+            thread.join()
+
+        plugin_globals["invoke_original"] = invoke_original
+        bound = _NoisyInterpolator().interpolate
+        quiet = _quiet_interpolate_method(bound)
+        self.assertIs(quiet.__self__, bound.__self__)
+        self.assertIs(quiet.__func__.__defaults__, plugin_function.__defaults__)
+        self.assertIs(quiet.__func__.__kwdefaults__, plugin_function.__kwdefaults__)
+        self.assertIs(quiet.__func__.__closure__, plugin_function.__closure__)
+        self.assertIs(quiet.__func__.test_metadata, metadata)
+
+        frames = _batch(_frame(value=0.0), _frame(value=0.4), _frame(value=0.8))
+        mappings = {
+            "DownloadAndLoadGIMMVFIModel": _Loader,
+            "GIMMVFI_interpolate": _NoisyInterpolator,
+        }
+        seen: list[tuple[int, int]] = []
+        memory = _Memory()
+        with self._comfy(memory):
+            output = interpolate_offline(
+                frames,
+                precision="fp32",
+                ds_factor=1.0,
+                models_dir=self.models,
+                node_mappings=mappings,
+                load_device=torch.device("cpu"),
+                progress=lambda done, total: seen.append((done, total)),
+            )
+
+        np.testing.assert_allclose(
+            output,
+            _batch(
+                frames[0],
+                (frames[0] + frames[1]) / 2,
+                frames[1],
+                (frames[1] + frames[2]) / 2,
+                frames[2],
+            ),
+        )
+        self.assertEqual(seen, [(1, 2), (2, 2)])
+        # Only the two concurrent standalone calls publish their own 1/1.
+        self.assertEqual(
+            progress_events,
+            [("init", 1), ("update", 1), ("init", 1), ("update", 1)],
+        )
+        self.assertEqual(tqdm_calls, [False, True, False, True])
+        self.assertEqual(globals_intact, [True, True])
+        self.assertEqual(thread_errors, [])
+        self.assertTrue(
+            all(
+                item[:3] == (closure_value, positional_default, keyword_default)
+                for item in bindings
+            )
+        )
+        self.assertIs(plugin_function.__globals__, plugin_globals)
+        self.assertIs(plugin_globals["ProgressBar"], _NoisyProgressBar)
+        self.assertIs(plugin_globals["tqdm"], noisy_tqdm)
+
+    def test_non_python_interpolator_fails_instead_of_running_noisily(self) -> None:
+        # Built-in/plugin callables cannot safely receive a copied globals dict.
+        with self.assertRaisesRegex(GimmVfiError, "ordinary Python bound instance method"):
+            _quiet_interpolate_method([].append)
+
     def test_single_frame_does_not_load_the_model(self) -> None:
         memory = _Memory()
         frames = _batch(_frame())
@@ -648,12 +804,90 @@ class GimmLifecycleTests(unittest.TestCase):
         memory = _Memory()
         memory.fail_on_pair = 2
         frames = _batch(_frame(value=0.0), _frame(value=0.2), _frame(value=0.4))
-        with self.assertRaises(_Cancel):
-            self._run(frames, memory)
+        # The second check is immediately after interpolate: cancellation raises
+        # from the first next(), before either produced frame can be yielded.
+        with self._comfy(memory):
+            stream = self._open_stream(frames, memory)
+            with self.assertRaises(_Cancel):
+                next(stream)
+        self.assertEqual(len(_Interpolator.calls), 1)
         self.assertEqual(len(memory.unloaded), 1)
         self.assertEqual(memory.caches, 2)
         self.assertTrue(memory.devices_while_loaded[0].startswith("cuda" if __import__("torch").cuda.is_available() else "cpu"))
         self.assertEqual(str(next(memory.unloaded[0].model.parameters()).device), "cpu")
+
+    def test_plugin_exceptions_keep_original_globals_and_unload(self) -> None:
+        # Both ordinary failures and cancellation-like BaseExceptions must cross
+        # the cloned call unchanged, with no global suppression left behind.
+        import torch
+
+        frames = _batch(_frame(value=0.0), _frame(value=0.2))
+
+        class _OriginalProgressBar:
+            def __init__(self, _total) -> None:
+                pass
+
+            def update(self, _amount) -> None:
+                pass
+
+        def original_tqdm(iterable, **_kwargs):
+            return iterable
+
+        for failure in (RuntimeError("plugin failed"), _Cancel()):
+            with self.subTest(failure=type(failure).__name__):
+                def interpolate(
+                    self,
+                    module,
+                    images,
+                    ds_factor,
+                    interpolation_factor,
+                    seed,
+                    output_flows=False,
+                ):
+                    del self, module, images, ds_factor, interpolation_factor, seed, output_flows
+                    ProgressBar(1).update(1)  # noqa: F821
+                    list(tqdm(range(1)))  # noqa: F821
+                    raise plugin_failure  # noqa: F821
+
+                plugin_globals = interpolate.__globals__.copy()
+                plugin_globals.update(
+                    ProgressBar=_OriginalProgressBar,
+                    tqdm=original_tqdm,
+                    plugin_failure=failure,
+                )
+                plugin_function = types.FunctionType(
+                    interpolate.__code__,
+                    plugin_globals,
+                    name="interpolate",
+                    argdefs=interpolate.__defaults__,
+                    closure=interpolate.__closure__,
+                )
+
+                class _FailingInterpolator:
+                    pass
+
+                _FailingInterpolator.interpolate = plugin_function
+                memory = _Memory()
+                mappings = self._mappings(memory)
+                mappings["GIMMVFI_interpolate"] = _FailingInterpolator
+                with self._comfy(memory):
+                    stream = iter_interpolate_offline(
+                        frames,
+                        2,
+                        precision="fp32",
+                        ds_factor=1.0,
+                        models_dir=self.models,
+                        node_mappings=mappings,
+                        load_device=torch.device("cpu"),
+                    )
+                    with self.assertRaises(type(failure)) as raised:
+                        next(stream)
+
+                self.assertIs(raised.exception, failure)
+                self.assertIs(plugin_function.__globals__, plugin_globals)
+                self.assertIs(plugin_globals["ProgressBar"], _OriginalProgressBar)
+                self.assertIs(plugin_globals["tqdm"], original_tqdm)
+                self.assertEqual(len(memory.unloaded), 1)
 
     def test_model_manager_load_failure_still_unloads_and_clears_cache(self) -> None:
         memory = _Memory()

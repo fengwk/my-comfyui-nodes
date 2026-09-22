@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import types
 import unittest
 from collections.abc import Callable
 from pathlib import Path
@@ -1138,30 +1139,35 @@ class PipelineRunTests(unittest.TestCase):
         return np.stack(produced)
 
     def test_progress_is_cumulative_across_both_stages(self) -> None:
-        seen: list[tuple[int, int]] = []
-        plan = VideoEnhancePlan(
-            enable_super_resolution=True, enable_frame_interpolation=True
-        )
         spec = FrameSpec(count=3, height=6, width=4)
-        total = pipeline_step_total(spec, plan)
-        self.assertEqual(total, 5)
-        with mock.patch(
-            "my_nodes.core.video_enhance.frame_pipeline.DlssStageStream",
-            _fake_dlss_stage(self.events),
-        ), mock.patch(
-            "my_nodes.core.video_enhance.frame_pipeline.iter_interpolate_offline",
-            _fake_vfi(self.events),
-        ):
-            self._run(
-                _stack(_frame(), _frame(value=0.5), _frame(value=0.9)),
-                spec,
-                plan,
-                progress=lambda done, reported: seen.append((done, reported)),
-                dlss=_dlss_options(),
-                vfi=_vfi_options(),
-            )
-        self.assertEqual([done for done, _total in seen], list(range(1, total + 1)))
-        self.assertEqual({reported for _done, reported in seen}, {total})
+        for stage_order in ("dlss_then_vfi", "vfi_then_dlss"):
+            with self.subTest(stage_order=stage_order):
+                seen: list[tuple[int, int]] = []
+                plan = VideoEnhancePlan(
+                    enable_super_resolution=True,
+                    enable_frame_interpolation=True,
+                    stage_order=stage_order,
+                )
+                total = pipeline_step_total(spec, plan)
+                self.assertEqual(total, 5 if stage_order == "dlss_then_vfi" else 7)
+                with mock.patch(
+                    "my_nodes.core.video_enhance.frame_pipeline.DlssStageStream",
+                    _fake_dlss_stage(self.events),
+                ), mock.patch(
+                    "my_nodes.core.video_enhance.frame_pipeline.iter_interpolate_offline",
+                    _fake_vfi(self.events),
+                ):
+                    self._run(
+                        _stack(_frame(), _frame(value=0.5), _frame(value=0.9)),
+                        spec,
+                        plan,
+                        progress=lambda done, reported: seen.append((done, reported)),
+                        dlss=_dlss_options(),
+                        vfi=_vfi_options(),
+                    )
+                # Either order has one publisher and one whole-run total.
+                self.assertEqual([done for done, _total in seen], list(range(1, total + 1)))
+                self.assertEqual({reported for _done, reported in seen}, {total})
 
     def test_a_stage_that_produces_the_wrong_frame_count_is_rejected(self) -> None:
         spec = FrameSpec(count=2, height=6, width=4)
@@ -1258,6 +1264,8 @@ class GimmStandIn:
     def __init__(self) -> None:
         self.events: list[str] = []
         self.interpolations = 0
+        self.progress_events: list[tuple[int, int]] = []
+        self.tqdm_calls = 0
         # Called by the model manager while the stage runs, after the first frame.
         self.on_load: Callable[[], None] | None = None
 
@@ -1274,16 +1282,43 @@ class GimmStandIn:
 
         owner = self
 
+        class _NoisyProgressBar:
+            def __init__(self, total) -> None:
+                self.total = int(total)
+                self.done = 0
+
+            def update(self, amount) -> None:
+                self.done += int(amount)
+                owner.progress_events.append((self.done, self.total))
+
+        def noisy_tqdm(iterable, *_args, disable=False, **_kwargs):
+            if not disable:
+                owner.tqdm_calls += 1
+            return iterable
+
         class _Interpolator:
-            def interpolate(
+            def template(
                 self, module, images, ds_factor, factor, seed, output_flows=False
             ):
                 del module, ds_factor, seed, output_flows
                 if factor != 2:
                     raise AssertionError(f"unexpected interpolation factor {factor}")
                 owner.interpolations += 1
+                pbar = ProgressBar(images.shape[0] - 1)  # noqa: F821
+                for _index in tqdm(range(images.shape[0] - 1)):  # noqa: F821
+                    pbar.update(1)
                 left, right = images[0], images[1]
                 return (torch.stack((left, (left + right) / 2, right)), torch.zeros(1))
+
+        plugin_globals = _Interpolator.template.__globals__.copy()
+        plugin_globals.update(ProgressBar=_NoisyProgressBar, tqdm=noisy_tqdm)
+        _Interpolator.interpolate = types.FunctionType(
+            _Interpolator.template.__code__,
+            plugin_globals,
+            name="interpolate",
+            argdefs=_Interpolator.template.__defaults__,
+            closure=_Interpolator.template.__closure__,
+        )
 
         def load_models_gpu(*_args, **_kwargs):
             owner.events.append("gimm-load-model")
@@ -1545,6 +1580,69 @@ class TwoStagePipelineTests(RealStageTestCase):
 
     def _expected_vfi_frames(self, frames: np.ndarray) -> np.ndarray:
         return _interpolate_frames(frames)
+
+    def test_pipeline_progress_excludes_gimm_pair_bars_for_all_stage_shapes(self) -> None:
+        # Unlike the planning-only progress test, every case runs production
+        # iter_interpolate_offline against a plugin method that would publish 1/1.
+        frames = _stack(_frame(value=0.2), _frame(value=0.6), _frame(value=0.9))
+        spec = FrameSpec(count=3, height=6, width=4)
+        plans = (
+            VideoEnhancePlan(enable_frame_interpolation=True),
+            VideoEnhancePlan(
+                enable_super_resolution=True,
+                enable_frame_interpolation=True,
+                sr_scale=2.0,
+                stage_order="dlss_then_vfi",
+            ),
+            VideoEnhancePlan(
+                enable_super_resolution=True,
+                enable_frame_interpolation=True,
+                sr_scale=2.0,
+                stage_order="vfi_then_dlss",
+            ),
+        )
+        for plan in plans:
+            with self.subTest(stages=plan.stages):
+                reported: list[tuple[int, int]] = []
+                self.gimm.progress_events = reported
+                self.gimm.tqdm_calls = 0
+                self.gimm.interpolations = 0
+                context = (
+                    mock.patch(
+                        "my_nodes.core.video_enhance.frame_pipeline.DlssStageStream",
+                        _fake_dlss_stage(self.gimm.events),
+                    )
+                    if plan.enable_super_resolution
+                    else contextlib.nullcontext()
+                )
+                with context:
+                    result = self._collect(
+                        frames,
+                        spec,
+                        plan,
+                        progress=lambda done, total: reported.append((done, total)),
+                        vfi=_vfi_options(),
+                        dlss=_dlss_options(),
+                    )
+
+                total = pipeline_step_total(spec, plan)
+                self.assertEqual([done for done, _total in reported], list(range(1, total + 1)))
+                self.assertEqual({value for _done, value in reported}, {total})
+                self.assertEqual(self.gimm.tqdm_calls, 0)
+                expected = _interpolate_frames(frames)
+                if plan.enable_super_resolution:
+                    if plan.stage_order == "dlss_then_vfi":
+                        enhanced = np.stack(
+                            [_nearest(frame, 12, 8) for frame in frames]
+                        )
+                        expected = _interpolate_frames(enhanced)
+                    else:
+                        expected = np.stack(
+                            [_nearest(frame, 12, 8) for frame in expected]
+                        )
+                actual = np.stack([self.written[index] for index in sorted(self.written)])
+                self.assertEqual(result.frame_count, len(expected))
+                np.testing.assert_allclose(actual, expected, rtol=0, atol=0)
 
     def test_vfi_then_dlss_unloads_gimm_before_the_worker_starts(self) -> None:
         for count in (1, 2, 3):

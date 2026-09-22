@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable, Iterator
+from functools import partial
+from types import FunctionType, MethodType
 
 import numpy as np
 
@@ -29,6 +31,70 @@ _PATCHERS: dict[tuple[str, str], object] = {}
 
 class GimmVfiError(RuntimeError):
     """The installed GIMM plugin or its offline weights cannot be used."""
+
+
+class _QuietProgressBar:
+    """Call-local replacement for the two ProgressBar operations GIMM uses."""
+
+    def __init__(self, *_args, **_kwargs) -> None:
+        pass
+
+    def update(self, *_args, **_kwargs) -> None:
+        pass
+
+
+def _quiet_tqdm(iterable, *_args, **_kwargs):
+    """Fallback for GIMM's `tqdm(range(...))` when no tqdm global is present."""
+    return iterable
+
+
+def _quiet_interpolate_method(method) -> MethodType:
+    """Clone a Python bound method with only its progress globals shadowed.
+
+    The installed plugin exposes no progress switch, so a shallow globals copy
+    keeps concurrent standalone calls untouched. This reuses the plugin's code
+    object and binding; it does not copy or reimplement its interpolation.
+    """
+    if (
+        not isinstance(method, MethodType)
+        or method.__self__ is None
+        or not isinstance(method.__func__, FunctionType)
+    ):
+        raise GimmVfiError(
+            "GIMMVFI_interpolate.interpolate must be an ordinary Python bound instance method "
+            "so its progress reporting can be isolated per call"
+        )
+
+    original = method.__func__
+    globals_copy = original.__globals__.copy()
+    globals_copy["ProgressBar"] = _QuietProgressBar
+    original_tqdm = globals_copy.get("tqdm")
+    if original_tqdm is None:
+        globals_copy["tqdm"] = _quiet_tqdm
+    elif callable(original_tqdm):
+        globals_copy["tqdm"] = partial(original_tqdm, disable=True)
+    else:
+        raise GimmVfiError(
+            "GIMMVFI_interpolate.interpolate has a non-callable tqdm global; "
+            "its progress reporting cannot be isolated"
+        )
+
+    cloned = FunctionType(
+        original.__code__,
+        globals_copy,
+        name=original.__name__,
+        argdefs=original.__defaults__,
+        closure=original.__closure__,
+    )
+    cloned.__kwdefaults__ = original.__kwdefaults__
+    cloned.__doc__ = original.__doc__
+    cloned.__module__ = original.__module__
+    cloned.__qualname__ = original.__qualname__
+    cloned.__annotations__ = original.__annotations__
+    cloned.__dict__.update(original.__dict__)
+    if hasattr(original, "__type_params__"):
+        cloned.__type_params__ = original.__type_params__
+    return MethodType(cloned, method.__self__)
 
 
 def gimm_model_dir(models_dir: str | os.PathLike[str]) -> str:
@@ -298,6 +364,7 @@ def iter_interpolate_offline(
         )
         _loader_cls, interpolator_cls = resolve_gimm_nodes(node_mappings)
         interpolator = interpolator_cls()
+        interpolate = _quiet_interpolate_method(interpolator.interpolate)
         required = patcher.model_size() if memory_required is None else int(memory_required)
         mm.load_models_gpu([patcher], memory_required=required, force_full_load=True)
         module = patcher.model
@@ -308,7 +375,7 @@ def iter_interpolate_offline(
             # Inference mode must not span a yield: the caller's own work runs
             # while this generator is suspended.
             with torch.inference_mode():
-                produced = interpolator.interpolate(
+                produced = interpolate(
                     module,
                     _pair_batch(left, right),
                     ds_factor,
@@ -316,6 +383,10 @@ def iter_interpolate_offline(
                     GIMM_SEED,
                     output_flows=False,
                 )
+            # The plugin's ProgressBar hook normally performs this cancellation
+            # check. Its call-local quiet replacement must preserve that timing.
+            if interrupt is not None:
+                interrupt()
             triple = _as_frames(produced)
             yield triple[0]
             yield triple[1]
