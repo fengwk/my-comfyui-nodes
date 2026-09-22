@@ -134,7 +134,13 @@ cp "$PROTON_FILES/lib/wine/nvapi/x86_64-windows/nvapi64.dll" "$PFX_SYS32/"
 cp "$PROTON_FILES/lib/wine/dxvk/x86_64-windows/dxgi.dll" "$PFX_SYS32/"
 ```
 
-##### 3. 硬件与驱动兼容性注意事项
+##### 3. 后台服务运行提示（systemd / 无桌面环境）
+Wine 的 Direct3D 12 呈现机制依赖 X11 Display。若通过 systemd 服务或后台脚本运行 ComfyUI，必须在启动脚本中导出 `DISPLAY` 环境变量（通常为 `:0`）：
+```bash
+export DISPLAY="${DISPLAY:-:0}"
+```
+
+##### 4. 硬件与驱动兼容性注意事项
 - **DLSS-SR（超分辨率 / DLAA 1.0x / 1.5x / 2.0x / 3.0x）**：
   - 支持 RTX 20/30/40 全系列 GPU。
   - 在 Linux + RTX 3090 + NVIDIA 驱动（已验证 610.57+）下已全面测试通过，运行稳定流畅。
