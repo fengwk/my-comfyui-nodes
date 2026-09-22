@@ -134,11 +134,40 @@ cp "$PROTON_FILES/lib/wine/nvapi/x86_64-windows/nvapi64.dll" "$PFX_SYS32/"
 cp "$PROTON_FILES/lib/wine/dxvk/x86_64-windows/dxgi.dll" "$PFX_SYS32/"
 ```
 
-##### 3. 后台服务运行提示（systemd / 无桌面环境）
-Wine 的 Direct3D 12 呈现机制依赖 X11 Display。若通过 systemd 服务或后台脚本运行 ComfyUI，必须在启动脚本中导出 `DISPLAY` 环境变量（通常为 `:0`）：
-```bash
-export DISPLAY="${DISPLAY:-:0}"
-```
+##### 3. 显示环境与无头服务器（Headless Server / Docker / 云 GPU）支持
+
+Wine 的 Direct3D 12 驱动在初始化交换链与离屏渲染上下文时，需要一个 X11 Display 协议端点。纯后台计算依然 100% 直通调用物理 NVIDIA 显卡，但需根据运行环境提供相应的 `DISPLAY`：
+
+- **桌面开发机 / 物理机（已有 Xorg 或桌面环境，但通过 systemd 后台服务启动）**：
+  直接在启动脚本（如 `run-comfyui`）中导出当前桌面的 Display：
+  ```bash
+  export DISPLAY="${DISPLAY:-:0}"
+  ```
+
+- **纯无头服务器（Linux Server / 云端 GPU 如 AutoDL、RunPod / Docker 容器）**：
+  纯命令行系统没有物理显示器和桌面环境，推荐使用轻量级虚拟帧缓冲 **`Xvfb`**（不消耗真实显示资源，内存中模拟端点）：
+  1. 安装 `Xvfb`：
+     - Ubuntu / Debian: `apt-get update && apt-get install -y xvfb`
+     - Arch Linux: `pacman -S xorg-server-xvfb`
+  2. 后台启动虚拟显示服务：
+     ```bash
+     Xvfb :99 -screen 0 1024x768x24 -nolisten tcp &
+     export DISPLAY=:99
+     ```
+
+- **推荐自适应启动脚本写法（桌面机与无头 Server 通用）**：
+  ```bash
+  if [ -z "${DISPLAY:-}" ]; then
+    if ! pgrep -x Xorg >/dev/null 2>&1 && command -v Xvfb >/dev/null 2>&1; then
+      # 纯无头环境：自动拉起 Xvfb 虚拟显示
+      Xvfb :99 -screen 0 1024x768x24 -nolisten tcp &
+      export DISPLAY=:99
+    else
+      # 本地桌面/服务环境：默认连接物理 :0
+      export DISPLAY=:0
+    fi
+  fi
+  ```
 
 ##### 4. 硬件与驱动兼容性注意事项
 - **DLSS-SR（超分辨率 / DLAA 1.0x / 1.5x / 2.0x / 3.0x）**：
