@@ -406,7 +406,264 @@ class BridgeContractTests(_NativeSourceTestCase):
         self.assertNotIn("if (g_upscale_active) {", allocate)
 
     def test_version_identifies_the_dnr3_build(self) -> None:
-        self.assertIn("0.5.0-dnr3-feature-flags", self.source)
+        self.assertIn("0.6.0-dnr3-advanced-controls", self.source)
+
+
+class AdvancedControlsContractTests(_NativeSourceTestCase):
+    """The launch-time detail/color/preset/channel-order contract.
+
+    The DNR3 wire protocol has no field for these controls, so the bridge reads
+    them from the environment the stage always sets explicitly, once per
+    session, and keeps the default readback byte-identical.
+    """
+
+    #: The env names the stage writes on every launch (see dlss_stage.py).
+    CONTROLS = (
+        "DLSS5NR_DETAIL",
+        "DLSS5NR_COLOR",
+        "DLSS5NR_SR_PRESET",
+        "DLSS5NR_CHANNEL_ORDER",
+    )
+    PRESET_KEYS = (
+        "DLAA",
+        "UltraQuality",
+        "Quality",
+        "Balanced",
+        "Performance",
+        "UltraPerformance",
+    )
+
+    def setUp(self) -> None:
+        self.source = _source(BRIDGE)
+        self.code = _code(BRIDGE)
+
+    def test_controls_are_read_from_the_environment_exactly_once(self) -> None:
+        init = self.function(BRIDGE, "dlss5nr_init3")
+        self.assertIn("ParseSessionControls();", init)
+        # The feature bits decide whether a composite can exist at all, so they
+        # must already be known when the controls are parsed.
+        self.assertLess(init.index("g_nr_enabled ="), init.index("ParseSessionControls();"))
+        parse = self.function(BRIDGE, "ParseSessionControls")
+        for name in self.CONTROLS:
+            with self.subTest(name=name):
+                self.assertIn(f'"{name}"', parse)
+                # One read per session: a per-frame re-read could change the
+                # strengths of a running worker mid-stream.
+                self.assertEqual(self.source.count(f'"{name}"'), 1)
+
+    def test_defaults_bypass_the_composite_entirely(self) -> None:
+        parse = self.function(BRIDGE, "ParseSessionControls")
+        self.assertIn('EnvFloat("DLSS5NR_DETAIL", DETAIL_DEFAULT, 0.0f, DETAIL_MAX)', parse)
+        self.assertIn('EnvFloat("DLSS5NR_COLOR", COLOR_DEFAULT, 0.0f, COLOR_MAX)', parse)
+        self.assertIn("static constexpr float DETAIL_DEFAULT = 1.0f;", self.source)
+        self.assertIn("static constexpr float COLOR_DEFAULT = 1.0f;", self.source)
+        self.assertIn("static constexpr float DETAIL_MAX = 2.0f;", self.source)
+        self.assertIn("static constexpr float COLOR_MAX = 1.0f;", self.source)
+        # Feature 18 is what makes a pre-NR frame composite over, and only a
+        # non-default strength asks for the blend at all.
+        self.assertIn("g_composite_active = g_nr_enabled &&", parse)
+        self.assertIn("g_detail_strength != DETAIL_DEFAULT", parse)
+        self.assertIn("g_color_strength != COLOR_DEFAULT", parse)
+
+    def test_malformed_controls_fall_back_instead_of_failing_a_frame(self) -> None:
+        parse = self.function(BRIDGE, "ParseSessionControls")
+        env_float = self.function(BRIDGE, "EnvFloat")
+        # Non-finite or unparsable strengths revert to the neutral default.
+        self.assertIn("std::isfinite(value)", env_float)
+        self.assertIn("return fallback;", env_float)
+        self.assertIn("std::clamp(value, lo, hi)", env_float)
+        # The preset has to stay inside the NGX hint enum; anything else is a
+        # caller bug and keeps the runtime's own default (0 = Default).
+        self.assertIn("static constexpr int SR_PRESET_DEFAULT = 0;", self.source)
+        self.assertIn("static constexpr int SR_PRESET_MAX = 13;", self.source)
+        self.assertIn("if (preset < 0 || preset > SR_PRESET_MAX)", parse)
+        self.assertIn("g_sr_render_preset = SR_PRESET_DEFAULT;", parse)
+        # The channel order name is matched, not cast: an unknown value must
+        # degrade to the detection instead of selecting a wrong order.
+        self.assertIn('"RGBA"', parse)
+        self.assertIn('"BGRA"', parse)
+        self.assertIn("g_channel_order_hint = CHANNEL_ORDER_AUTO;", parse)
+
+    def test_all_six_render_preset_hints_are_set_before_feature_creation(self) -> None:
+        carrier = self.function(BRIDGE, "SetDLSSCarrierParams")
+        for key in self.PRESET_KEYS:
+            with self.subTest(key=key):
+                self.assertIn(
+                    f'SetParamUInt("DLSS.Hint.Render.Preset.{key}", '
+                    "static_cast<unsigned int>(g_sr_render_preset));",
+                    carrier,
+                )
+        ensure = self.function(BRIDGE, "EnsureFeature")
+        # Feature 1 is created with the carrier parameters, so the hints are in
+        # place before CreateFeature runs (and for DLAA just as for SR).
+        self.assertLess(ensure.index("SetDLSSCarrierParams(perf_quality, 1)"), ensure.index("g_core_create("))
+
+    def test_compositing_needs_the_pre_nr_baseline_of_the_session(self) -> None:
+        baseline = self.function(BRIDGE, "BaselineTexture")
+        self.assertIn("return g_sr_enabled ? g_dlss_output.Get() : g_color.Get();", baseline)
+        # Feature 18 is fed exactly that surface, so the composite blends the
+        # neural result over the frame it was computed from.
+        neural = self.function(BRIDGE, "SetNeuralParams")
+        self.assertIn("ID3D12Resource* color = g_sr_enabled ? g_dlss_output.Get() : g_color.Get();", neural)
+        self.assertIn('SetParamResource("DLSSNR.Color", color);', neural)
+
+    def test_baseline_readback_exists_only_while_a_composite_is_active(self) -> None:
+        allocate = self.function(BRIDGE, "AllocateFrameResources")
+        guard = allocate.index("if (g_composite_active) {")
+        created = allocate.index("g_baseline_readback = CreateLinearBuffer")
+        self.assertLess(guard, created)
+        # The extra readback is allocated once per session, never per frame, and
+        # only the activated branch reaches the allocation.
+        self.assertEqual(allocate.count("g_baseline_readback = CreateLinearBuffer"), 1)
+        self.assertEqual(allocate.count("g_baseline_readback"), 2)
+
+    def test_the_baseline_is_copied_in_the_same_submission_and_read_back(self) -> None:
+        process = self.function(BRIDGE, "ProcessFrame")
+        # The baseline copy is enqueued before the single wait that publishes
+        # the neural result, so both readbacks come from the same submission.
+        copy = process.index("bd.pResource = g_baseline_readback.Get()")
+        self.assertLess(copy, process.index("if (!ExecuteAndWait()) {", copy))
+        self.assertIn("g_cmd->CopyTextureRegion(&bd, 0, 0, 0, &bs, nullptr);", process)
+        # The baseline is a shader resource of the frame, not a UAV: it is
+        # transitioned around the copy and handed back exactly as it was.
+        self.assertIn(
+            "auto b2 = Barrier(baseline, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,\n"
+            "                          D3D12_RESOURCE_STATE_COPY_SOURCE);",
+            process,
+        )
+        self.assertIn(
+            "auto b2b = Barrier(baseline, D3D12_RESOURCE_STATE_COPY_SOURCE,\n"
+            "                           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);",
+            process,
+        )
+        # Both readbacks are mapped and unmapped for the composite.
+        self.assertEqual(process.count("g_baseline_readback->Map"), 1)
+        self.assertIn("if (baseline_base) g_baseline_readback->Unmap(0, nullptr);", process)
+
+    def test_composite_is_the_video2dlssnr_v1_4_1_sdr_formula(self) -> None:
+        to_linear = self.function(BRIDGE, "SrgbToLinear")
+        self.assertIn("c <= 0.04045f", to_linear)
+        self.assertIn("c / 12.92f", to_linear)
+        self.assertIn("std::pow((c + 0.055f) / 1.055f, 2.4f)", to_linear)
+        to_srgb = self.function(BRIDGE, "LinearToSrgb")
+        self.assertIn("c <= 0.0031308f", to_srgb)
+        self.assertIn("1.055f * std::pow(c, 1.0f / 2.4f) - 0.055f", to_srgb)
+
+        composite = self.function(BRIDGE, "CompositeSdr")
+        # Rec.709 luma for both frames, decoded to linear light first.
+        self.assertIn("orig[c] = SrgbToLinear(baseline[c]);", composite)
+        self.assertIn("nr[c] = SrgbToLinear(neural[c]);", composite)
+        for coefficient in ("0.2126f", "0.7152f", "0.0722f"):
+            with self.subTest(coefficient=coefficient):
+                self.assertEqual(composite.count(coefficient), 2)
+        self.assertIn("const float scale = nr_luma / std::max(orig_luma, 1e-4f);", composite)
+        self.assertIn("const float orig_hue_at_nr_luma = orig[c] * scale;", composite)
+        self.assertIn(
+            "const float colored = orig_hue_at_nr_luma + (nr[c] - orig_hue_at_nr_luma) * color;",
+            composite,
+        )
+        self.assertIn(
+            "out[c] = std::clamp(LinearToSrgb(orig[c] + (colored - orig[c]) * detail), 0.0f, 1.0f);",
+            composite,
+        )
+
+    def test_composite_uses_the_parsed_strengths_and_logical_rgb(self) -> None:
+        process = self.function(BRIDGE, "ProcessFrame")
+        self.assertIn(
+            "CompositeSdr(out, baseline, neural, g_detail_strength, g_color_strength);",
+            process,
+        )
+        # The neural channels are decoded from the raw readback into logical RGB
+        # before the formula sees them.
+        self.assertIn(
+            "const float neural[3] = { raw_bgra ? raw2 : raw0, raw1, raw_bgra ? raw0 : raw2 };",
+            process,
+        )
+        self.assertIn(
+            "const float baseline[3] = {\n"
+            "                    HalfToFloat(brow[x * 4 + 0]), HalfToFloat(brow[x * 4 + 1]), "
+            "HalfToFloat(brow[x * 4 + 2]) };",
+            process,
+        )
+
+    def test_raw_output_order_is_honored_and_written_back_unchanged(self) -> None:
+        order = self.function(BRIDGE, "RawOutputIsBgra")
+        self.assertIn("if (g_channel_order_hint == CHANNEL_ORDER_BGRA) return true;", order)
+        self.assertIn("if (g_channel_order_hint == CHANNEL_ORDER_RGBA) return false;", order)
+        self.assertIn("return g_auto_raw_bgra > 0;", order)
+
+        process = self.function(BRIDGE, "ProcessFrame")
+        # Only a composite may interpret the raw order, and it is emitted in
+        # that same order so the caller's apply_channel_order stays correct
+        # (including detail=0, which then carries the pre-NR frame itself).
+        self.assertIn("const bool raw_bgra = g_composite_active && RawOutputIsBgra();", process)
+        self.assertIn("dstf[x * 3 + 0] = raw_bgra ? out[2] : out[0];", process)
+        self.assertIn("dstf[x * 3 + 1] = out[1];", process)
+        self.assertIn("dstf[x * 3 + 2] = raw_bgra ? out[0] : out[2];", process)
+        # Without a composite the channels still leave exactly as stored.
+        self.assertIn("out[0] = std::clamp(out[0], 0.0f, 1.0f);", process)
+        self.assertIn("out[1] = std::clamp(out[1], 0.0f, 1.0f);", process)
+        self.assertIn("out[2] = std::clamp(out[2], 0.0f, 1.0f);", process)
+
+    def test_auto_channel_order_is_detected_once_and_cached_with_the_resources(self) -> None:
+        detect = self.function(BRIDGE, "ResolveAutoChannelOrder")
+        # Both frames are compared raw and R/B swapped, like the Python stage
+        # compares a first input/output pair.
+        self.assertIn("g_auto_raw_bgra = swapped < direct ? 1 : 0;", detect)
+        self.assertIn("direct += std::fabs(n0 - b0) + std::fabs(n1 - b1) + std::fabs(n2 - b2);", detect)
+        self.assertIn("swapped += std::fabs(n2 - b0) + std::fabs(n1 - b1) + std::fabs(n0 - b2);", detect)
+        # The decision is reported once, when it is made.
+        self.assertIn(
+            '"[dlss5nr] composite channel order (auto) resolved: %s (direct=%.3f swapped=%.3f)\\n"',
+            self.source,
+        )
+
+        process = self.function(BRIDGE, "ProcessFrame")
+        self.assertIn("if (g_channel_order_hint == CHANNEL_ORDER_AUTO && g_auto_raw_bgra < 0) {", process)
+        self.assertIn("ResolveAutoChannelOrder(baseline_base, base, output_width, output_height);", process)
+        # A new feature/resource lifetime resolves the order again ...
+        release = self.function(BRIDGE, "ReleaseFeatureAndResources")
+        self.assertIn("g_auto_raw_bgra = -1;", release)
+        self.assertIn("g_baseline_readback.Reset();", release)
+        # ... and so does a fresh process.
+        shutdown = self.function(BRIDGE, "ShutdownUnlocked")
+        for reset in ("g_composite_active = false;", "g_auto_raw_bgra = -1;",
+                      "g_detail_strength = DETAIL_DEFAULT;", "g_color_strength = COLOR_DEFAULT;",
+                      "g_sr_render_preset = SR_PRESET_DEFAULT;",
+                      "g_channel_order_hint = CHANNEL_ORDER_AUTO;"):
+            with self.subTest(reset=reset):
+                self.assertIn(reset, shutdown)
+
+    def test_advanced_controls_never_touch_the_wire_contract(self) -> None:
+        # The controls ride in the environment; the host must not read them and
+        # the DNR3 header keeps its 72 bytes and its fields.
+        host = _source(HOST)
+        for name in self.CONTROLS:
+            with self.subTest(name=name):
+                self.assertNotIn(name, host)
+        self.assertEqual(dnr3.HEADER_SIZE, 72)
+        self.assertEqual(
+            [field.name for field in dataclasses.fields(dnr3.Header)],
+            ["input_width", "input_height", "output_width", "output_height", "warmup_frames",
+             "frame_count", "perf_quality", "features", "preset", "style", "automask",
+             "ui_correction", "intensity", "tone", "structure", "skin", "global_tone"],
+        )
+        # Both bridge entry points keep the signature the host and the DNR3
+        # Python writer already speak.
+        self.assertIn(
+            "dlss5nr_init3(int gpu_index, const wchar_t* runtime_dir,\n"
+            "                                               unsigned int features, char* err, int err_cap)",
+            self.source,
+        )
+        self.assertIn(
+            "__declspec(dllexport) int __cdecl dlss5nr_process_v3(\n"
+            "    const float* rgb_in, const uint16_t* mvec_in, float* rgb_out,\n"
+            "    int input_width, int input_height, int output_width, int output_height,\n"
+            "    int style, int preset, int perf_quality,\n"
+            "    float intensity, float tone, float structure, float skin, float global_tone,\n"
+            "    int automask, int reset, char* err, int err_cap) {",
+            self.source,
+        )
 
 
 class HostContractTests(_NativeSourceTestCase):

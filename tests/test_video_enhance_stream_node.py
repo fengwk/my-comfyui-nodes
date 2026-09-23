@@ -12,6 +12,7 @@ success, on failure and on cancellation.
 from __future__ import annotations
 
 import io as io_module
+import json
 import os
 import shutil
 import sys
@@ -32,13 +33,20 @@ from my_nodes.core.video_enhance.frame_pipeline import (
     pipeline_specs,
     pipeline_step_total,
 )
+from my_nodes.core.video_enhance.nr_profiles import (
+    PRESET_IDS,
+    STYLE_IDS,
+    plan_neural_rendering_settings,
+)
 from my_nodes.core.video_enhance.plan import (
+    CUSTOM_NR_PROFILE,
     STAGE_ORDER_DLSS_THEN_VFI,
     STAGE_ORDER_VFI_THEN_DLSS,
     STAGE_ORDERS,
+    VideoEnhancePlan,
 )
 from my_nodes.core.video_enhance.video_io import VideoIOError, VideoSpec
-from my_nodes.nodes.video_enhance import MyVideoEnhance
+from my_nodes.nodes.video_enhance import ADVANCED_OPTIONAL, MyVideoEnhance
 from my_nodes.nodes.video_enhance_stream import (
     FRAME_STORE_DIRECTORY,
     OUTPUT_CODECS,
@@ -48,6 +56,8 @@ from my_nodes.nodes.video_enhance_stream import (
 from my_nodes.registry import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 
 import my_nodes.nodes.video_enhance_stream as stream_module
+
+from .video_enhance_fixtures import ADVANCED_CONTROLS, ADVANCED_NAMES, ADVANCED_VALUES
 
 ALL_STAGES_OFF = {
     "enable_super_resolution": False,
@@ -449,6 +459,80 @@ class NodeContractTests(unittest.TestCase):
         self.assertEqual(stage_order[1]["default"], STAGE_ORDER_VFI_THEN_DLSS)
         self.assertTrue(stage_order[1]["advanced"])
 
+    def test_the_advanced_controls_are_appended_after_the_legacy_widgets(self) -> None:
+        optional = MyVideoEnhanceStream.INPUT_TYPES()["optional"]
+        names = list(optional)
+        self.assertEqual(list(ADVANCED_OPTIONAL), ADVANCED_NAMES)
+        self.assertEqual(names[-len(ADVANCED_NAMES) - 1 :], ["stage_order"] + ADVANCED_NAMES)
+        self.assertEqual(names[: -len(ADVANCED_NAMES)], [
+            "vfi_precision",
+            "vfi_ds_factor",
+            "motion",
+            "scene_cut_threshold",
+            "channel_order",
+            "runtime_dir",
+            "wine_prefix",
+            "worker_timeout",
+            "stage_order",
+        ])
+        # Same widget, defaults and ranges as the IMAGE node, and the defaults
+        # are the plan defaults of the fields they write.
+        image_optional = MyVideoEnhance.INPUT_TYPES()["optional"]
+        plan_defaults = VideoEnhancePlan()
+        for name, (field, bounds) in ADVANCED_CONTROLS.items():
+            with self.subTest(control=name):
+                self.assertEqual(optional[name], image_optional[name])
+                self.assertIs(optional[name][1]["advanced"], True)
+                self.assertEqual(optional[name][1]["default"], getattr(plan_defaults, field))
+                if bounds is not None:
+                    options = optional[name][1]
+                    self.assertEqual((options["min"], options["max"]), bounds)
+
+    def test_the_example_workflow_serializes_the_current_widget_order(self) -> None:
+        # Workflows restore widget arrays positionally by default. Matching the
+        # current schema here proves the importable example cannot shift a
+        # legacy stage_order value into the first appended advanced control.
+        workflow_path = Path(__file__).parents[1] / "docs" / "video_enhance_stream.json"
+        workflow = json.loads(workflow_path.read_text(encoding="utf-8"))
+        node = next(
+            item for item in workflow["nodes"] if item["type"] == "MyVideoEnhanceStream"
+        )
+        input_names = [item["name"] for item in node["inputs"] if item["name"] != "video"]
+        contract = MyVideoEnhanceStream.INPUT_TYPES()
+        expected_names = list(contract["required"])[1:] + list(contract["optional"])
+        self.assertEqual(input_names, expected_names)
+        self.assertEqual(len(node["widgets_values"]), len(expected_names))
+
+        values = dict(zip(input_names, node["widgets_values"], strict=True))
+        self.assertEqual(values["stage_order"], STAGE_ORDER_VFI_THEN_DLSS)
+        for name in ADVANCED_NAMES:
+            with self.subTest(control=name):
+                self.assertEqual(values[name], ADVANCED_OPTIONAL[name][1]["default"])
+
+    def test_the_v3_schema_keeps_the_advanced_widgets_in_order(self) -> None:
+        try:
+            from comfy_api.latest import io
+        except ImportError:
+            self.skipTest("comfy_api is not installed in this interpreter")
+        schema = MyVideoEnhanceStream.define_schema()
+        ids = [item.id for item in schema.inputs]
+        self.assertEqual(ids[-len(ADVANCED_NAMES) - 1 :], ["stage_order"] + ADVANCED_NAMES)
+        by_id = {item.id: item for item in schema.inputs}
+        # The IMAGE node's v3 schema is built from the same classic widgets, so
+        # both node schemas must agree widget by widget.
+        image_schema = {item.id: item for item in MyVideoEnhance.define_schema().inputs}
+        for name in ADVANCED_NAMES:
+            with self.subTest(control=name):
+                widget = by_id[name]
+                self.assertTrue(widget.advanced)
+                self.assertEqual(widget.default, ADVANCED_OPTIONAL[name][1]["default"])
+                self.assertEqual(widget.tooltip, ADVANCED_OPTIONAL[name][1]["tooltip"])
+                self.assertEqual(widget.default, image_schema[name].default)
+                self.assertEqual(
+                    getattr(widget, "options", None), getattr(image_schema[name], "options", None)
+                )
+        self.assertIsNotNone(io)
+
     def test_the_v3_schema_exposes_native_video_sockets(self) -> None:
         try:
             from comfy_api.latest import io
@@ -474,6 +558,40 @@ class NodeContractTests(unittest.TestCase):
 
 
 class WidgetValidationTests(_StreamTestCase):
+    def test_every_advanced_control_reaches_the_plan(self) -> None:
+        # A stage has to run, otherwise the pass-through path never builds the
+        # pipeline call this test inspects.
+        widgets = dict(ADVANCED_VALUES, enable_neural_rendering=True)
+        video_io = _FakeVideoIO(_spec(self.root), self.log)
+        result = self.run_node(_FileVideo(self.root / "source.mkv"), video_io, **widgets)
+        plan = result.calls[0].plan
+        for name, (field, _bounds) in ADVANCED_CONTROLS.items():
+            with self.subTest(control=name):
+                self.assertEqual(getattr(plan, field), ADVANCED_VALUES[name])
+        # The same 11 values a workflow sets are inert for a built-in profile,
+        # exactly as in the DNR3 header.
+        self.assertIs(plan_neural_rendering_settings(plan).ui_correction, False)
+
+        # `custom` is the profile that reads them, so the resolved model fields
+        # are the mapped widget values.
+        custom = self.run_node(
+            _FileVideo(self.root / "source.mkv"),
+            _FakeVideoIO(_spec(self.root), self.log),
+            **dict(widgets, nr_profile=CUSTOM_NR_PROFILE),
+        )
+        custom_plan = custom.calls[0].plan
+        self.assertEqual(custom_plan.nr_profile, CUSTOM_NR_PROFILE)
+        settings = plan_neural_rendering_settings(custom_plan)
+        self.assertEqual(settings.profile, CUSTOM_NR_PROFILE)
+        self.assertEqual(settings.style, STYLE_IDS[str(ADVANCED_VALUES["style"])])
+        self.assertEqual(settings.preset, PRESET_IDS[str(ADVANCED_VALUES["preset"])])
+        self.assertEqual(settings.intensity, custom_plan.nr_intensity)
+        self.assertEqual(settings.structure, ADVANCED_VALUES["local_structure"])
+        self.assertEqual(settings.tone, ADVANCED_VALUES["local_tone"])
+        self.assertEqual(settings.skin, ADVANCED_VALUES["skin"])
+        self.assertIs(settings.automask, True)
+        self.assertIs(settings.ui_correction, True)
+
     def test_bad_widget_values_fail_before_any_tool_runs(self) -> None:
         for widgets, error in (
             ({"output_codec": "libvpx"}, ValueError),
@@ -533,6 +651,15 @@ class SourceContractTests(_StreamTestCase):
         error = self.assert_fails(ValueError, object(), None, enable_frame_interpolation=True)
         self.assertIn("native file-backed VIDEO", str(error))
         self.assertIn("object", str(error))
+
+    def test_a_missing_file_is_rejected_before_ffmpeg_is_imported(self) -> None:
+        video = _FileVideo(self.root / "missing.mkv")
+        error = self.assert_fails(
+            ValueError, video, None, enable_frame_interpolation=True
+        )
+        self.assertIn("existing local video file", str(error))
+        self.assertIn("missing.mkv", str(error))
+        self.assertEqual(self.temp_residue(), [])
 
     def test_a_probe_failure_propagates_before_any_file_is_owned(self) -> None:
         source = _spec(self.root)

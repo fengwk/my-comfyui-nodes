@@ -40,11 +40,13 @@ from my_nodes.core.video_enhance.plan import (
     VideoEnhancePlan,
 )
 from my_nodes.nodes.video_enhance import (
+    ADVANCED_OPTIONAL,
     CHANNEL_ORDERS,
     NODE_CATEGORY,
     SPATIAL_LABELS,
     STAGE_ORDER_TOOLTIP,
     VFI_PRECISIONS,
+    _advanced_inputs,
     _check_choice,
     _plan,
     _progress_bar,
@@ -82,8 +84,8 @@ DESCRIPTION = (
     "requires a local seekable CFR SDR file and processes all of it: variable frame "
     "rate, live sources and active trim windows are rejected. 1.0 is native DLAA, "
     "not an upscale; neural-rendering profiles are local UX presets, not NVIDIA "
-    "official presets; frame interpolation is offline GIMM-VFI, not DLSS Frame "
-    "Generation."
+    "official presets, and the advanced model fields are read by nr_profile=custom; "
+    "frame interpolation is offline GIMM-VFI, not DLSS Frame Generation."
 )
 
 
@@ -141,7 +143,13 @@ def _local_video_path(video) -> Path:
             f"behind it (get_stream_source returned {type(source).__name__}). Save it to "
             "a file first, for example with a video output node."
         )
-    return Path(os.fspath(source))
+    path = Path(os.fspath(source))
+    if not path.is_file():
+        raise ValueError(
+            f"MyVideoEnhanceStream needs an existing local video file, but {path} is not "
+            "a regular file. Save the VIDEO to a local file first."
+        )
+    return path
 
 
 def _reject_trim_window(video) -> None:
@@ -194,7 +202,10 @@ class MyVideoEnhanceStream:
                 }),
                 "nr_profile": (list(NR_PROFILES), {
                     "default": "standard",
-                    "tooltip": "Local UX profile, not an NVIDIA official preset.",
+                    "tooltip": (
+                        "Local UX profile, not an NVIDIA official preset. custom "
+                        "reads the advanced model fields instead."
+                    ),
                 }),
                 "nr_intensity": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
                 "enable_frame_interpolation": ("BOOLEAN", {
@@ -238,6 +249,9 @@ class MyVideoEnhanceStream:
                     "default": STAGE_ORDER_VFI_THEN_DLSS, "advanced": True,
                     "tooltip": STAGE_ORDER_TOOLTIP,
                 }),
+                # Append new controls so old positional widget arrays still map
+                # all pre-existing fields, including stage_order, correctly.
+                **ADVANCED_OPTIONAL,
             },
         }
 
@@ -267,6 +281,17 @@ class MyVideoEnhanceStream:
         wine_prefix="",
         worker_timeout=600.0,
         stage_order=STAGE_ORDER_VFI_THEN_DLSS,
+        style="Cinematic",
+        preset="Default",
+        local_structure=1.0,
+        local_tone=1.0,
+        skin=-1.0,
+        detail=1.0,
+        color=1.0,
+        ui_correction=False,
+        auto_mask=False,
+        sr_preset="Default",
+        gpu_index=0,
     ):
         plan = _plan(
             enable_super_resolution,
@@ -276,6 +301,17 @@ class MyVideoEnhanceStream:
             nr_intensity,
             enable_frame_interpolation,
             stage_order,
+            style=style,
+            preset=preset,
+            local_structure=local_structure,
+            local_tone=local_tone,
+            skin=skin,
+            detail=detail,
+            color=color,
+            ui_correction=ui_correction,
+            auto_mask=auto_mask,
+            sr_preset=sr_preset,
+            gpu_index=gpu_index,
         )
         _check_choice(str(vfi_precision), VFI_PRECISIONS, "vfi_precision")
         _check_choice(str(motion), MOTION_MODES, "motion")
@@ -391,7 +427,7 @@ class MyVideoEnhanceStream:
                     io.Boolean.Input("enable_super_resolution", default=False, tooltip="DLSS feature 1. 1.0 is native DLAA."),
                     io.Combo.Input("spatial_mode", options=list(SPATIAL_LABELS), default="2.0x"),
                     io.Boolean.Input("enable_neural_rendering", default=False, tooltip="Experimental DLSS feature 18."),
-                    io.Combo.Input("nr_profile", options=list(NR_PROFILES), default="standard", tooltip="Local UX profile, not an NVIDIA preset."),
+                    io.Combo.Input("nr_profile", options=list(NR_PROFILES), default="standard", tooltip="Local UX profile, not an NVIDIA preset. custom reads the advanced model fields instead."),
                     io.Float.Input("nr_intensity", default=1.0, min=0.0, max=2.0, step=0.05),
                     io.Boolean.Input("enable_frame_interpolation", default=False, tooltip="Offline GIMM-VFI 2x, not DLSS Frame Generation."),
                     io.Combo.Input("output_codec", options=list(OUTPUT_CODECS), default=DEFAULT_OUTPUT_CODEC, tooltip=CODEC_TOOLTIP),
@@ -405,6 +441,7 @@ class MyVideoEnhanceStream:
                     io.String.Input("wine_prefix", default="", advanced=True),
                     io.Float.Input("worker_timeout", default=600.0, min=1.0, max=86400.0, step=1.0, advanced=True),
                     io.Combo.Input("stage_order", options=list(STAGE_ORDERS), default=STAGE_ORDER_VFI_THEN_DLSS, advanced=True, tooltip=STAGE_ORDER_TOOLTIP),
+                    *_advanced_inputs(),
                 ],
                 outputs=[
                     io.Video.Output(display_name="video"),

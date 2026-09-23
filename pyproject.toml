@@ -7,6 +7,8 @@ requires-python = ">=3.10"
 dependencies = [
   "numpy",
   "Pillow",
+  "einops",
+  "safetensors",
 ]
 
 [build-system]
@@ -21,6 +23,7 @@ include = ["my_nodes*"]
 # package. NVIDIA runtime DLLs are never part of the package.
 [tool.setuptools.package-data]
 "my_nodes.core.video_enhance" = ["native/*", "native/**/*"]
+"my_nodes.core.vosr2" = ["*.txt", "*.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

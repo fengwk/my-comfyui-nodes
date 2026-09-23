@@ -23,11 +23,15 @@ import numpy as np
 from my_nodes.core.video_enhance import FEATURE_NR, FEATURE_SR
 from my_nodes.core.video_enhance.channel_order import select_channel_order, swap_rb
 from my_nodes.core.video_enhance.dlss_stage import (
+    SR_PRESET_IDS,
+    FrameValidationError,
+    apply_worker_environment,
     build_header,
     output_dimensions,
     prepare_frames,
     resolve_runtime_dir,
     run_dlss_stage,
+    worker_environment,
 )
 from my_nodes.core.video_enhance.frame_pipeline import FrameSpec, PipelineResult
 from my_nodes.core.video_enhance.gimm_vfi import (
@@ -44,26 +48,47 @@ from my_nodes.core.video_enhance.gimm_vfi import (
     resolve_gimm_nodes,
 )
 from my_nodes.core.video_enhance.motion import MOTION_NONE, MotionGuideError, MotionGuides
-from my_nodes.core.video_enhance.nr_profiles import neural_rendering_settings
+from my_nodes.core.video_enhance.nr_profiles import (
+    PRESET_IDS,
+    STYLE_IDS,
+    plan_neural_rendering_settings,
+    neural_rendering_settings,
+)
 from my_nodes.core.video_enhance.plan import (
+    CUSTOM_NR_PROFILE,
+    NR_PRESETS,
     NR_PROFILES,
+    NR_STYLES,
+    SR_PRESETS,
     STAGE_ORDER_DLSS_THEN_VFI,
     STAGE_ORDER_VFI_THEN_DLSS,
     STAGE_ORDERS,
     VideoEnhancePlan,
 )
-from my_nodes.core.video_enhance.runtime import HostDriver
+from my_nodes.core.video_enhance.runtime import HostDriver, RuntimeFiles
 from my_nodes.nodes.video_enhance import (
+    ADVANCED_OPTIONAL,
+    CUSTOM_PROFILE_ONLY,
     SPATIAL_LABELS,
     InsufficientRamError,
     MyDLSSRuntimeProbe,
     MyVideoEnhance,
     OUTPUT_RAM_FRACTION,
+    _plan,
     spatial_scale,
 )
 from my_nodes.registry import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 
-from .video_enhance_fixtures import assert_process_gone, create_runtime_dir, fake_worker_command, read_report
+from .video_enhance_fake_dnr3_worker import WATCHED_ENV
+from .video_enhance_fixtures import (
+    ADVANCED_CONTROLS,
+    ADVANCED_NAMES,
+    ADVANCED_VALUES,
+    assert_process_gone,
+    create_runtime_dir,
+    fake_worker_command,
+    read_report,
+)
 
 
 def _batch(*frames: np.ndarray) -> np.ndarray:
@@ -77,6 +102,11 @@ def _frame(width: int = 4, height: int = 6, value: float = 0.2) -> np.ndarray:
     return frame
 
 
+def _advanced_options(name: str) -> dict:
+    """The classic widget options of one advanced control."""
+    return ADVANCED_OPTIONAL[name][1]
+
+
 class ProfileAndHeaderTests(unittest.TestCase):
     def test_profile_mapping_is_explicit_and_not_scaled_by_intensity(self) -> None:
         # The widget intensity replaces only the intensity field. Documented here
@@ -87,12 +117,130 @@ class ProfileAndHeaderTests(unittest.TestCase):
             "portrait": dict(style=1, preset=0, tone=1.0, structure=1.0, skin=1.0, global_tone=-1.0, automask=False),
             "detail": dict(style=0, preset=0, tone=1.0, structure=1.5, skin=-1.0, global_tone=-1.0, automask=True),
         }
-        self.assertEqual(tuple(expected), NR_PROFILES)
+        # `custom` is appended: it is not a table entry but the plan's own fields.
+        self.assertEqual(tuple(expected) + (CUSTOM_NR_PROFILE,), NR_PROFILES)
         for profile, fields in expected.items():
             settings = neural_rendering_settings(profile, 0.5)
             for name, value in fields.items():
                 self.assertEqual(getattr(settings, name), value, msg=f"{profile}.{name}")
             self.assertEqual(settings.intensity, 0.5)
+            # No built-in profile turns the UI correction on by itself.
+            self.assertIs(settings.ui_correction, False)
+
+    def test_custom_profile_has_no_fixed_table_and_maps_every_plan_field(self) -> None:
+        # `custom` cannot be resolved from the table, so a caller cannot confuse
+        # it with a built-in preset.
+        with self.assertRaises(ValueError):
+            neural_rendering_settings(CUSTOM_NR_PROFILE, 1.0)
+        plan = VideoEnhancePlan(
+            enable_neural_rendering=True,
+            nr_profile=CUSTOM_NR_PROFILE,
+            nr_intensity=1.5,
+            nr_style="Natural",
+            nr_preset="Preset 3",
+            nr_local_structure=0.5,
+            nr_local_tone=1.25,
+            nr_skin=0.75,
+            nr_detail=1.6,
+            nr_color=0.5,
+            nr_ui_correction=True,
+            nr_auto_mask=True,
+            sr_preset="K",
+        )
+        settings = plan_neural_rendering_settings(plan)
+        self.assertEqual(settings.profile, CUSTOM_NR_PROFILE)
+        self.assertEqual(settings.style, STYLE_IDS["Natural"])
+        self.assertEqual(settings.preset, PRESET_IDS["Preset 3"])
+        self.assertEqual(settings.intensity, 1.5)
+        self.assertEqual(settings.tone, 1.25)
+        self.assertEqual(settings.structure, 0.5)
+        self.assertEqual(settings.skin, 0.75)
+        self.assertEqual(settings.automask, True)
+        self.assertEqual(settings.ui_correction, True)
+        # Global tone is not exposed: it keeps the model default.
+        self.assertEqual(settings.global_tone, -1.0)
+
+    def test_every_style_and_preset_choice_resolves_to_its_model_selector(self) -> None:
+        expected_styles = {"Default": 0, "Natural": 1, "Cinematic": 2}
+        expected_presets = {"Default": 0, "Preset 1": 1, "Preset 2": 2, "Preset 3": 3}
+        self.assertEqual(STYLE_IDS, expected_styles)
+        self.assertEqual(PRESET_IDS, expected_presets)
+        self.assertEqual(NR_STYLES, tuple(expected_styles))
+        self.assertEqual(NR_PRESETS, tuple(expected_presets))
+        for style, style_id in expected_styles.items():
+            for preset, preset_id in expected_presets.items():
+                with self.subTest(style=style, preset=preset):
+                    plan = VideoEnhancePlan(
+                        nr_profile=CUSTOM_NR_PROFILE, nr_style=style, nr_preset=preset
+                    )
+                    plan_settings = plan_neural_rendering_settings(plan)
+                    self.assertEqual(plan_settings.style, style_id)
+                    self.assertEqual(plan_settings.preset, preset_id)
+                    header = build_header(
+                        VideoEnhancePlan(
+                            enable_neural_rendering=True,
+                            nr_profile=CUSTOM_NR_PROFILE,
+                            nr_style=style,
+                            nr_preset=preset,
+                        ),
+                        _batch(_frame()),
+                    )
+                    self.assertEqual(header.style, style_id)
+                    self.assertEqual(header.preset, preset_id)
+
+    def test_custom_header_carries_the_plan_fields(self) -> None:
+        plan = VideoEnhancePlan(
+            enable_super_resolution=True,
+            enable_neural_rendering=True,
+            sr_scale=2.0,
+            nr_profile=CUSTOM_NR_PROFILE,
+            nr_intensity=0.25,
+            nr_style="Cinematic",
+            nr_preset="Preset 2",
+            nr_local_structure=0.5,
+            nr_local_tone=1.75,
+            nr_skin=0.25,
+            nr_ui_correction=True,
+            nr_auto_mask=True,
+        )
+        header = build_header(plan, _batch(_frame()))
+        self.assertEqual(header.features, FEATURE_SR | FEATURE_NR)
+        self.assertEqual(header.style, STYLE_IDS["Cinematic"])
+        self.assertEqual(header.preset, PRESET_IDS["Preset 2"])
+        self.assertEqual(header.intensity, 0.25)
+        self.assertEqual(header.tone, 1.75)
+        self.assertEqual(header.structure, 0.5)
+        self.assertEqual(header.skin, 0.25)
+        self.assertEqual(header.automask, True)
+        self.assertEqual(header.ui_correction, True)
+        self.assertEqual(header.global_tone, -1.0)
+
+    def test_builtin_profiles_ignore_every_advanced_field(self) -> None:
+        # An existing workflow never set them, and setting them must not move a
+        # built-in profile's header either.
+        base = VideoEnhancePlan(enable_neural_rendering=True, nr_profile="portrait")
+        tweaked = VideoEnhancePlan(
+            enable_neural_rendering=True,
+            nr_profile="portrait",
+            nr_style="Natural",
+            nr_preset="Preset 1",
+            nr_local_structure=0.25,
+            nr_local_tone=0.25,
+            nr_skin=1.75,
+            nr_ui_correction=True,
+            nr_auto_mask=True,
+        )
+        for name in ("style", "preset", "intensity", "tone", "structure", "skin",
+                     "global_tone", "automask", "ui_correction"):
+            with self.subTest(field=name):
+                self.assertEqual(
+                    getattr(build_header(base, _batch(_frame())), name),
+                    getattr(build_header(tweaked, _batch(_frame())), name),
+                )
+        self.assertEqual(
+            plan_neural_rendering_settings(tweaked),
+            neural_rendering_settings("portrait", 1.0),
+        )
 
     def test_scale_one_keeps_native_size_and_larger_scales_round_even(self) -> None:
         self.assertEqual(output_dimensions(5, 7, 1.0), (5, 7))
@@ -216,6 +364,132 @@ class DlssStageIntegrationTests(unittest.TestCase):
         np.testing.assert_allclose(result.frames[1], swap_rb(_frame(value=0.3)))
         self._pids.append(int(read_report(report)["pid"]))
 
+    def test_the_custom_factory_driver_gets_the_explicit_launch_environment(self) -> None:
+        # The child process itself reports the six values: a stale variable of
+        # the same name in this process must not survive into the worker.
+        report = self.root / "custom-env.json"
+        plan = VideoEnhancePlan(
+            enable_neural_rendering=True,
+            nr_profile=CUSTOM_NR_PROFILE,
+            nr_intensity=1.25,
+            nr_style="Natural",
+            nr_preset="Preset 1",
+            nr_local_tone=1.5,
+            nr_skin=0.5,
+            nr_detail=1.5,
+            nr_color=0.5,
+            nr_ui_correction=True,
+            nr_auto_mask=True,
+            sr_preset="L",
+            gpu_index=3,
+        )
+        with mock.patch.dict(os.environ, {name: "stale" for name in WATCHED_ENV}):
+            result = run_dlss_stage(
+                plan,
+                _batch(_frame(value=0.2), _frame(value=0.4)),
+                runtime_dir="unused",
+                wine_prefix="",
+                channel_order="auto",
+                motion_mode=MOTION_NONE,
+                scene_cut_threshold=0.2,
+                driver_factory=self._factory(FEATURE_NR, report),
+                memory_hooks=(lambda: None, lambda: None),
+            )
+        self.assertEqual(result.frames.shape[0], 2)
+        wire = read_report(report)
+        self._pids.append(int(wire["pid"]))
+        self.assertEqual(
+            wire["env"],
+            {
+                "DLSS5NR_UI_CORRECTION": "1",
+                "DLSS5NR_DETAIL": "1.5",
+                "DLSS5NR_COLOR": "0.5",
+                "DLSS5NR_SR_PRESET": str(SR_PRESET_IDS["L"]),
+                "DLSS5NR_GPU_INDEX": "3",
+                "DLSS5NR_CHANNEL_ORDER": "auto",
+            },
+        )
+        # The header carries the same resolved UI correction as the environment.
+        self.assertEqual(wire["header"]["ui_correction"], 1)
+        self.assertEqual(wire["header"]["style"], STYLE_IDS["Natural"])
+        self.assertEqual(wire["header"]["preset"], PRESET_IDS["Preset 1"])
+        self.assertEqual(wire["header"]["structure"], 1.0)
+
+    def test_the_builtin_driver_is_asked_for_the_selected_gpu_and_the_plan_environment(
+        self,
+    ) -> None:
+        # The built-in path is the only one that may receive the new keyword, and
+        # mocking the factory proves the argument without spawning Wine.
+        report = self.root / "builtin.json"
+        plan = VideoEnhancePlan(enable_neural_rendering=True, gpu_index=2)
+        directory = create_runtime_dir(self.root / "runtime-builtin", FEATURE_NR)
+        seen: list[dict] = []
+
+        def fake_wine(**kwargs):
+            seen.append(kwargs)
+            env = dict(os.environ)
+            env["FAKE_DNR3_REPORT"] = str(report)
+            return HostDriver.direct(
+                fake_worker_command("ok"),
+                runtime_dir=kwargs["runtime_dir"],
+                features=kwargs["features"],
+                env=env,
+            )
+
+        with mock.patch.object(HostDriver, "wine", side_effect=fake_wine):
+            run_dlss_stage(
+                plan,
+                _batch(_frame()),
+                runtime_dir=str(directory),
+                wine_prefix="",
+                channel_order="RGBA",
+                motion_mode=MOTION_NONE,
+                scene_cut_threshold=0.2,
+                memory_hooks=(lambda: None, lambda: None),
+            )
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0]["gpu_index"], 2)
+        self.assertEqual(seen[0]["features"], FEATURE_NR)
+        self.assertEqual(seen[0]["runtime_dir"], str(directory))
+        wire = read_report(report)
+        self._pids.append(int(wire["pid"]))
+        self.assertEqual(wire["env"]["DLSS5NR_GPU_INDEX"], "2")
+        self.assertEqual(wire["env"]["DLSS5NR_CHANNEL_ORDER"], "RGBA")
+
+    def test_a_custom_factory_that_only_knows_the_old_keywords_still_works(self) -> None:
+        # The documented signature of a custom factory is unchanged: three
+        # keywords and no gpu_index. Passing a fourth keyword would raise a
+        # TypeError here instead of quietly changing the factory contract.
+        report = self.root / "old-factory.json"
+        plan = VideoEnhancePlan(enable_neural_rendering=True, gpu_index=1)
+        directory = create_runtime_dir(self.root / "runtime-old-factory", FEATURE_NR)
+        calls: list[str] = []
+
+        def factory(*, runtime_dir, features, wine_prefix):
+            calls.append(wine_prefix or "")
+            env = dict(os.environ)
+            env["FAKE_DNR3_REPORT"] = str(report)
+            return HostDriver.direct(
+                fake_worker_command("ok"), runtime_dir=runtime_dir, features=features, env=env
+            )
+
+        run_dlss_stage(
+            plan,
+            _batch(_frame()),
+            runtime_dir=str(directory),
+            wine_prefix="",
+            channel_order="auto",
+            motion_mode=MOTION_NONE,
+            scene_cut_threshold=0.2,
+            driver_factory=factory,
+            memory_hooks=(lambda: None, lambda: None),
+        )
+        self.assertEqual(calls, [""])
+        wire = read_report(report)
+        self._pids.append(int(wire["pid"]))
+        # The GPU index still reaches the worker, through the overlaid driver env.
+        self.assertEqual(wire["env"]["DLSS5NR_GPU_INDEX"], "1")
+
     def test_worker_is_reaped_when_the_interrupt_raises_base_exception(self) -> None:
         report = self.root / "interrupt.json"
         plan = VideoEnhancePlan(enable_super_resolution=True, sr_scale=2.0)
@@ -277,6 +551,112 @@ class DlssStageIntegrationTests(unittest.TestCase):
             "/from-env",
         )
         self.assertEqual(resolve_runtime_dir("  ", env={}, models_dir="/models"), os.path.join("/models", "dlss5"))
+
+
+class WorkerEnvironmentTests(unittest.TestCase):
+    """The launch environment is explicit, plan-derived and overlay-only."""
+
+    def _driver(self, env: dict[str, str]) -> HostDriver:
+        """A frozen driver with the given environment, without touching a disk."""
+        files = RuntimeFiles(
+            features=FEATURE_NR,
+            directory=Path("/runtime"),
+            core=Path("/runtime/_nvngx.dll"),
+            sr=None,
+            nr=Path("/runtime/nvngx_dlssnr.dll"),
+            nr_name="nvngx_dlssnr.dll",
+        )
+        return HostDriver(files=files, command=("/runtime/host.exe",), env=env)
+
+    def test_defaults_are_the_documented_ones(self) -> None:
+        # A workflow that never set a new widget keeps the raw model output: the
+        # values below are exactly what the old build's child environment implied.
+        self.assertEqual(
+            worker_environment(VideoEnhancePlan(), "auto"),
+            {
+                "DLSS5NR_UI_CORRECTION": "0",
+                "DLSS5NR_DETAIL": "1.0",
+                "DLSS5NR_COLOR": "1.0",
+                "DLSS5NR_SR_PRESET": "0",
+                "DLSS5NR_GPU_INDEX": "0",
+                "DLSS5NR_CHANNEL_ORDER": "auto",
+            },
+        )
+
+    def test_every_plan_control_reaches_its_own_variable(self) -> None:
+        plan = VideoEnhancePlan(
+            nr_profile=CUSTOM_NR_PROFILE,
+            nr_detail=1.5,
+            nr_color=0.5,
+            nr_ui_correction=True,
+            sr_preset="M",
+            gpu_index=7,
+        )
+        self.assertEqual(
+            worker_environment(plan, "BGRA"),
+            {
+                "DLSS5NR_UI_CORRECTION": "1",
+                "DLSS5NR_DETAIL": "1.5",
+                "DLSS5NR_COLOR": "0.5",
+                "DLSS5NR_SR_PRESET": "13",
+                "DLSS5NR_GPU_INDEX": "7",
+                "DLSS5NR_CHANNEL_ORDER": "BGRA",
+            },
+        )
+        # Detail and color apply to every profile, not only to `custom`.
+        builtin = VideoEnhancePlan(nr_detail=0.5, nr_color=0.25)
+        self.assertEqual(worker_environment(builtin, "auto")["DLSS5NR_DETAIL"], "0.5")
+        self.assertEqual(worker_environment(builtin, "auto")["DLSS5NR_COLOR"], "0.25")
+        # Only `custom` can turn the UI correction on; the built-in profiles
+        # ignore the field, exactly like the header does.
+        self.assertEqual(worker_environment(VideoEnhancePlan(nr_ui_correction=True), "auto")[
+            "DLSS5NR_UI_CORRECTION"
+        ], "0")
+
+    def test_the_sr_preset_ids_cover_the_offered_choices(self) -> None:
+        # The mapping is the wire contract with the native bridge, so a new
+        # choice cannot be added without deciding its model selector.
+        self.assertEqual(tuple(SR_PRESET_IDS), SR_PRESETS)
+        self.assertEqual(
+            SR_PRESET_IDS,
+            {"Default": 0, "E": 5, "F": 6, "J": 10, "K": 11, "L": 12, "M": 13},
+        )
+        for preset, preset_id in SR_PRESET_IDS.items():
+            with self.subTest(preset=preset):
+                plan = VideoEnhancePlan(sr_preset=preset)
+                self.assertEqual(worker_environment(plan, "auto")["DLSS5NR_SR_PRESET"], str(preset_id))
+
+    def test_an_unknown_channel_order_fails_before_a_launch(self) -> None:
+        with self.assertRaises(FrameValidationError):
+            worker_environment(VideoEnhancePlan(), "bgra")
+
+    def test_equal_plans_write_equal_environments(self) -> None:
+        self.assertEqual(
+            worker_environment(VideoEnhancePlan(nr_detail=1, nr_color=1), "auto"),
+            worker_environment(VideoEnhancePlan(nr_detail=1.0, nr_color=1.0), "auto"),
+        )
+
+    def test_stale_parent_values_are_replaced_and_the_rest_is_kept(self) -> None:
+        stale = {name: "stale" for name in WATCHED_ENV}
+        stale.update({"DISPLAY": ":99", "PATH": "/usr/bin", "WINEPREFIX": "/prefix"})
+        driver = apply_worker_environment(
+            self._driver(stale),
+            VideoEnhancePlan(nr_detail=1.25, sr_preset="J"),
+            "RGBA",
+        )
+        self.assertEqual(driver.env["DLSS5NR_DETAIL"], "1.25")
+        self.assertEqual(driver.env["DLSS5NR_SR_PRESET"], "10")
+        self.assertEqual(driver.env["DLSS5NR_CHANNEL_ORDER"], "RGBA")
+        self.assertNotIn("stale", set(driver.env.values()))
+        # The Wine setup and every unrelated variable survive untouched.
+        self.assertEqual(driver.env["DISPLAY"], ":99")
+        self.assertEqual(driver.env["PATH"], "/usr/bin")
+        self.assertEqual(driver.env["WINEPREFIX"], "/prefix")
+        # Only the environment changed: the driver stays the same frozen object
+        # with the same command and runtime files.
+        self.assertEqual(driver.command, ("/runtime/host.exe",))
+        self.assertEqual(driver.files, self._driver({}).files)
+        self.assertEqual(self._driver(stale).env, stale)
 
 
 class MotionResetTests(unittest.TestCase):
@@ -915,11 +1295,11 @@ class NodeContractTests(unittest.TestCase):
         self.assertIn("DLAA", SPATIAL_LABELS[0])
         self.assertEqual(spatial_scale("1.0 DLAA (native)"), 1.0)
 
-    def test_legacy_schema_keeps_its_widgets_and_appends_stage_order(self) -> None:
+    def test_legacy_schema_keeps_stage_order_at_its_existing_index(self) -> None:
         types = MyVideoEnhance.INPUT_TYPES()
         optional = list(types["optional"])
         self.assertEqual(optional[:3], ["vfi_precision", "vfi_ds_factor", "motion"])
-        self.assertEqual(optional[-1], "stage_order")
+        self.assertEqual(optional[8], "stage_order")
         options, widget = types["optional"]["stage_order"]
         self.assertEqual(options, list(STAGE_ORDERS))
         self.assertEqual(widget["default"], STAGE_ORDER_DLSS_THEN_VFI)
@@ -1137,6 +1517,137 @@ class NodeContractTests(unittest.TestCase):
         self.assertEqual(dlss.call_args.kwargs["motion_mode"], "none")
         self.assertEqual(dlss.call_args.args[1].shape, (1, 32, 32, 3))
 
+    def test_the_advanced_controls_are_appended_after_the_legacy_widgets(self) -> None:
+        optional = MyVideoEnhance.INPUT_TYPES()["optional"]
+        # The names and their order are the contract the workflow depends on.
+        self.assertEqual(list(ADVANCED_OPTIONAL), ADVANCED_NAMES)
+        names = list(optional)
+        self.assertEqual(
+            names[-len(ADVANCED_NAMES) - 1 :], ["stage_order"] + ADVANCED_NAMES
+        )
+        self.assertEqual(optional["stage_order"][1]["default"], STAGE_ORDER_DLSS_THEN_VFI)
+        # ComfyUI's default restore path reads widgets_values positionally. Keep
+        # the complete old prefix stable so existing workflows cannot shift
+        # stage_order into the first newly added field.
+        self.assertEqual(names[: -len(ADVANCED_NAMES)], [
+            "vfi_precision",
+            "vfi_ds_factor",
+            "motion",
+            "scene_cut_threshold",
+            "channel_order",
+            "runtime_dir",
+            "wine_prefix",
+            "worker_timeout",
+            "stage_order",
+        ])
+        # Every advanced control is optional, advanced, documented and defaults
+        # to exactly the plan default it writes.
+        plan_defaults = VideoEnhancePlan()
+        for name, (field, bounds) in ADVANCED_CONTROLS.items():
+            with self.subTest(control=name):
+                options = optional[name][1]
+                self.assertIs(options["advanced"], True)
+                self.assertIn("tooltip", options)
+                self.assertEqual(options["default"], getattr(plan_defaults, field))
+                if bounds is not None:
+                    self.assertEqual((options["min"], options["max"]), bounds)
+        # The choice lists are the plan's, so a node can never offer a value the
+        # plan rejects.
+        self.assertEqual(list(optional["style"][0]), list(NR_STYLES))
+        self.assertEqual(list(optional["preset"][0]), list(NR_PRESETS))
+        self.assertEqual(list(optional["sr_preset"][0]), list(SR_PRESETS))
+        self.assertEqual(optional["style"][1]["default"], "Cinematic")
+        self.assertEqual(optional["preset"][1]["default"], "Default")
+        self.assertEqual(optional["sr_preset"][1]["default"], "Default")
+        self.assertEqual(optional["gpu_index"][0], "INT")
+        self.assertEqual(optional["gpu_index"][1]["step"], 1)
+        for name in ("ui_correction", "auto_mask"):
+            self.assertEqual(optional[name][0], "BOOLEAN")
+
+    def test_the_plan_builder_defaults_match_the_widget_defaults(self) -> None:
+        # Both the widgets and `_plan` carry the defaults, so they are compared
+        # instead of being restated in two places that can drift apart.
+        import inspect
+
+        parameters = inspect.signature(_plan).parameters
+        for name, (field, _bounds) in ADVANCED_CONTROLS.items():
+            with self.subTest(control=name):
+                self.assertEqual(parameters[name].default, getattr(VideoEnhancePlan(), field))
+
+    def test_the_model_tooltips_name_the_custom_profile(self) -> None:
+        # The user has to learn from the widget itself that a model field only
+        # applies to `custom`, while detail/color are post-NR composites.
+        for name in (
+            "style", "preset", "local_structure", "local_tone", "skin",
+            "ui_correction", "auto_mask",
+        ):
+            with self.subTest(control=name):
+                self.assertIn(CUSTOM_PROFILE_ONLY, _advanced_options(name)["tooltip"])
+        for name in ("detail", "color"):
+            with self.subTest(control=name):
+                tooltip = _advanced_options(name)["tooltip"]
+                self.assertIn("Post-NR", tooltip)
+                self.assertIn("not only with nr_profile=custom", tooltip)
+        self.assertIn("super resolution", _advanced_options("sr_preset")["tooltip"])
+        self.assertIn("GPU", _advanced_options("gpu_index")["tooltip"])
+        # The profile widget itself points at the advanced model fields.
+        self.assertIn("custom", MyVideoEnhance.INPUT_TYPES()["required"]["nr_profile"][1]["tooltip"])
+
+    def test_every_advanced_control_reaches_the_plan(self) -> None:
+        result = self._pipeline_call(**ADVANCED_VALUES)
+        plan = result.call["plan"]
+        for name, (field, _bounds) in ADVANCED_CONTROLS.items():
+            with self.subTest(control=name):
+                self.assertEqual(getattr(plan, field), ADVANCED_VALUES[name])
+        # A built-in profile ignores all of them, so nothing about it changes.
+        self.assertIs(plan_neural_rendering_settings(plan).ui_correction, False)
+        # `custom` is the profile that reads them: the header therefore shows the
+        # mapped model selectors and the plan's own strengths.
+        custom = self._pipeline_call(nr_profile=CUSTOM_NR_PROFILE, **ADVANCED_VALUES)
+        custom_plan = custom.call["plan"]
+        self.assertEqual(custom_plan.nr_profile, CUSTOM_NR_PROFILE)
+        settings = plan_neural_rendering_settings(custom_plan)
+        self.assertEqual(settings.profile, CUSTOM_NR_PROFILE)
+        self.assertEqual(settings.style, STYLE_IDS[str(ADVANCED_VALUES["style"])])
+        self.assertEqual(settings.preset, PRESET_IDS[str(ADVANCED_VALUES["preset"])])
+        self.assertEqual(settings.intensity, custom_plan.nr_intensity)
+        self.assertEqual(settings.structure, ADVANCED_VALUES["local_structure"])
+        self.assertEqual(settings.tone, ADVANCED_VALUES["local_tone"])
+        self.assertEqual(settings.skin, ADVANCED_VALUES["skin"])
+        self.assertIs(settings.automask, True)
+        self.assertIs(settings.ui_correction, True)
+        header = build_header(custom_plan, _batch(_frame(), _frame(value=0.5)))
+        self.assertEqual(header.style, settings.style)
+        self.assertEqual(header.preset, settings.preset)
+        self.assertEqual(header.ui_correction, 1)
+
+    def test_the_v3_schema_exposes_the_same_advanced_widgets(self) -> None:
+        try:
+            from comfy_api.latest import io
+        except ImportError:
+            self.skipTest("comfy_api is not installed in this interpreter")
+        schema = MyVideoEnhance.define_schema()
+        ids = [item.id for item in schema.inputs]
+        self.assertEqual(ids[-len(ADVANCED_NAMES) - 1 :], ["stage_order"] + ADVANCED_NAMES)
+        # The v3 form is generated from the classic widgets, so one comparison
+        # covers the names, defaults, ranges, choices, flags and tooltips.
+        by_id = {item.id: item for item in schema.inputs}
+        classic = MyVideoEnhance.INPUT_TYPES()["optional"]
+        for name in ADVANCED_NAMES:
+            with self.subTest(control=name):
+                widget = by_id[name]
+                _kind, options = ADVANCED_OPTIONAL[name]
+                self.assertTrue(widget.advanced)
+                self.assertEqual(widget.default, options["default"])
+                self.assertEqual(widget.tooltip, options["tooltip"])
+                for key in ("min", "max", "step"):
+                    if key in options:
+                        self.assertEqual(getattr(widget, key, None), options[key], key)
+                if isinstance(_kind, list):
+                    self.assertEqual(list(widget.options), _kind)
+                self.assertEqual(classic[name][1]["default"], widget.default)
+        self.assertIsNotNone(io)
+
     def test_define_schema_outputs_match_when_comfy_api_is_present(self) -> None:
         try:
             from comfy_api.latest import io
@@ -1149,8 +1660,8 @@ class NodeContractTests(unittest.TestCase):
         self.assertIn("enable_frame_interpolation", ids)
         advanced = [item.id for item in schema.inputs if getattr(item, "advanced", False)]
         self.assertIn("vfi_ds_factor", advanced)
-        # The new stage order is appended and advanced, like every other new knob.
-        self.assertEqual(ids[-1], "stage_order")
+        # New controls follow stage_order to preserve old positional workflows.
+        self.assertEqual(ids[-len(ADVANCED_NAMES) - 1], "stage_order")
         self.assertIn("stage_order", advanced)
         self.assertEqual([output.display_name for output in schema.outputs], ["images", "fps_multiplier", "status"])
         self.assertIsNotNone(io)

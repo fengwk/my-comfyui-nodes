@@ -158,7 +158,10 @@ class VideoSpec:
     `path` is the probed file, `width`/`height` its coded size, `frame_count`
     the exact number of frames `FFmpegFrameReader` yields, `fps` its nominal
     frame rate, `has_audio` whether it carries an audio stream and
-    `pixel_format` the source pixel format as FFprobe reported it.
+    `pixel_format` the source pixel format as FFprobe reported it, and
+    `video_start_time` the first decoded video frame's presentation timestamp.
+    The latter lets the remux move the source audio by the same amount that raw
+    frame decoding and re-encoding moved the video.
     """
 
     path: Path
@@ -168,6 +171,7 @@ class VideoSpec:
     fps: Fraction
     has_audio: bool
     pixel_format: str
+    video_start_time: Fraction = Fraction(0)
 
     def __post_init__(self) -> None:
         if not isinstance(self.path, Path):
@@ -186,6 +190,11 @@ class VideoSpec:
             raise TypeError(f"has_audio must be a bool, got {type(self.has_audio).__name__}")
         if not isinstance(self.pixel_format, str) or not self.pixel_format:
             raise ValueError(f"pixel_format must be a non-empty string, got {self.pixel_format!r}")
+        if not isinstance(self.video_start_time, Fraction):
+            raise TypeError(
+                "video_start_time must be a fractions.Fraction, got "
+                f"{type(self.video_start_time).__name__}"
+            )
 
 
 # --------------------------------------------------------------------- probe
@@ -215,7 +224,7 @@ def probe_cfr_video(
     _checked_geometry(stream, path)
     fps = _nominal_fps(stream, path)
     pixel_format = _checked_pixel_format(stream, path)
-    frame_count = _scan_frame_timestamps(path, ffprobe, fps, interrupt)
+    frame_count, video_start_time = _scan_frame_timestamps(path, ffprobe, fps, interrupt)
     return VideoSpec(
         path=path,
         width=width,
@@ -224,6 +233,7 @@ def probe_cfr_video(
         fps=fps,
         has_audio=any(entry.get("codec_type") == "audio" for entry in streams),
         pixel_format=pixel_format,
+        video_start_time=video_start_time,
     )
 
 
@@ -500,9 +510,10 @@ def _checked_pixel_format(stream: dict[str, Any], path: Path) -> str:
             f"{path} uses the floating point pixel format {pixel_format}; the streaming "
             "node needs 8-bit SDR input"
         )
-    if bits > 8:
+    if bits != 8:
         raise VideoIOError(
-            f"{path} is {bits}-bit ({pixel_format}); the streaming node needs 8-bit SDR input"
+            f"{path} is {bits}-bit ({pixel_format}); the streaming node needs exactly "
+            "8-bit SDR input"
         )
     transfer = str(stream.get("color_transfer", "")).strip().lower()
     primaries = str(stream.get("color_primaries", "")).strip().lower()
@@ -533,7 +544,7 @@ def _bit_depth(pixel_format: str, bits_per_raw_sample: object) -> int | None:
 
 def _scan_frame_timestamps(
     path: Path, ffprobe: str, fps: Fraction, interrupt: Callable[[], object] | None
-) -> int:
+) -> tuple[int, Fraction]:
     """Count the decoded frames of `path` and prove that its cadence is constant.
 
     The frames are decoded and reported in display order, which is the order the
@@ -562,10 +573,10 @@ def _scan_frame_timestamps(
         "csv=p=0",
         str(path),
     )
-    nominal = float(fps.denominator) / float(fps.numerator)
-    bound = max(CADENCE_DRIFT_FLOOR_SECONDS, CADENCE_DRIFT_RATIO * nominal)
-    first: float | None = None
-    previous: float | None = None
+    nominal = Fraction(1, 1) / fps
+    bound = max(CADENCE_DRIFT_FLOOR_SECONDS, CADENCE_DRIFT_RATIO * float(nominal))
+    first: Fraction | None = None
+    previous: Fraction | None = None
     count = 0
     with _ProbeProcess(command, interrupt=interrupt) as probe:
         for line in probe.lines(limit=SCAN_LINE_LIMIT_BYTES, what="frame timestamps"):
@@ -574,7 +585,7 @@ def _scan_frame_timestamps(
             if previous is not None and timestamp <= previous:
                 raise VideoIOError(
                     f"{path} is not constant frame rate: frame {count} has the timestamp "
-                    f"{timestamp:.6f} s after {previous:.6f} s, so the timestamps are "
+                    f"{float(timestamp):.6f} s after {float(previous):.6f} s, so the timestamps are "
                     "duplicated or out of order. Variable frame rate (VFR) video and "
                     "timestamps that do not match the declared frame rate are not supported."
                 )
@@ -583,11 +594,12 @@ def _scan_frame_timestamps(
             else:
                 expected = first + (count - 1) * nominal
                 drift = timestamp - expected
-                if abs(drift) > bound:
+                if abs(float(drift)) > bound:
                     raise VideoIOError(
                         f"{path} is not constant frame rate: frame {count} is timestamped "
-                        f"{timestamp:.6f} s where {fps} fps puts it at {expected:.6f} s, "
-                        f"{abs(drift) * 1000:.3f} ms off (tolerated {bound * 1000:.3f} ms). "
+                        f"{float(timestamp):.6f} s where {fps} fps puts it at "
+                        f"{float(expected):.6f} s, {abs(float(drift)) * 1000:.3f} ms off "
+                        f"(tolerated {bound * 1000:.3f} ms). "
                         "Variable frame rate (VFR) video and timestamps that do not match "
                         "the declared frame rate are not supported."
                     )
@@ -595,10 +607,11 @@ def _scan_frame_timestamps(
         probe.finish(what=f"scanning the frame timestamps of {path}")
     if count == 0:
         raise VideoIOError(f"{path} contains no video frames")
-    return count
+    assert first is not None
+    return count, first
 
 
-def _parse_timestamp(line: str, index: int, path: Path) -> float:
+def _parse_timestamp(line: str, index: int, path: Path) -> Fraction:
     """One `csv=p=0` frame line as seconds.
 
     The timestamp is the line's first field: the frame printer appends the side
@@ -611,18 +624,20 @@ def _parse_timestamp(line: str, index: int, path: Path) -> float:
             "its constant frame rate cannot be verified"
         )
     try:
-        timestamp = float(text)
+        numeric = float(text)
     except ValueError as error:
         raise VideoIOError(
             f"ffprobe reported the unusable presentation timestamp {text!r} for frame "
             f"{index} of {path}"
         ) from error
-    if not math.isfinite(timestamp):
+    if not math.isfinite(numeric):
         raise VideoIOError(
             f"ffprobe reported the non-finite presentation timestamp {text!r} for frame "
             f"{index} of {path}"
         )
-    return timestamp
+    # FFprobe prints a finite decimal. Keeping it as a Fraction avoids adding
+    # binary floating-point noise to the remux offset derived from it.
+    return Fraction(text)
 
 
 class _ProbeProcess:
@@ -1311,8 +1326,13 @@ def remux_audio(
     """Put the encoded video and the source's first audio track into one file.
 
     Both streams are copied, never re-encoded, and no `-shortest` shortens
-    either of them. The output muxer follows the output suffix, so the `.mkv`
-    file the streaming node uses is Matroska. When the source has no audio the
+    either of them. Raw-frame processing makes the new video start at zero, so
+    the source input is shifted by the negative of its first decoded video PTS.
+    `-copyts` prevents FFmpeg from independently normalizing the two inputs, and
+    `-avoid_negative_ts make_zero` moves all output streams together if audio
+    originally began before video. Their relative start offset is therefore
+    preserved. The output muxer follows the output suffix, so the `.mkv` file
+    the streaming node uses is Matroska. When the source has no audio the
     video-only file simply replaces the output, without starting FFmpeg at all.
     A failed remux removes the partial output but keeps the caller's video-only
     file.
@@ -1338,8 +1358,11 @@ def remux_audio(
         "-nostdin",
         "-v",
         "error",
+        "-copyts",
         "-i",
         str(video_only),
+        "-itsoffset",
+        _timestamp_text(-source.video_start_time),
         "-i",
         str(source.path),
         "-map",
@@ -1348,6 +1371,8 @@ def remux_audio(
         "1:a:0",
         "-c",
         "copy",
+        "-avoid_negative_ts",
+        "make_zero",
         "-f",
         container,
         str(output),
@@ -1498,6 +1523,15 @@ def _fps_text(fps: Fraction) -> str:
     if fps.denominator == 1:
         return str(fps.numerator)
     return f"{fps.numerator}/{fps.denominator}"
+
+
+def _timestamp_text(timestamp: Fraction) -> str:
+    """A stable decimal duration accepted by FFmpeg's `-itsoffset`."""
+    # FFprobe's timestamp_time fields have microsecond precision in practice.
+    # Nine decimal places retain that precision with margin while avoiding a
+    # long repeating decimal for arbitrary Fraction values supplied in tests.
+    text = f"{float(timestamp):.9f}".rstrip("0").rstrip(".")
+    return "0" if text in {"", "-0"} else text
 
 
 def _container_format(path: Path) -> str:

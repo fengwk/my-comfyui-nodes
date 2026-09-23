@@ -356,8 +356,11 @@ def fake_ffmpeg_encode(
                 time.sleep({delay!r})
             if frames_before_exit is not None and frames >= frames_before_exit:
                 break
-        with open({str(report_file)!r}, "w", encoding="utf-8") as handle:
+        report_path = {str(report_file)!r}
+        report_temp = report_path + ".tmp"
+        with open(report_temp, "w", encoding="utf-8") as handle:
             json.dump({{"argv": argv, "frames": frames, "payload": payload.hex()}}, handle)
+        os.replace(report_temp, report_path)
         if not {skip_output!r}:
             with open(output, "wb") as handle:
                 handle.write(bytes(payload[:{output_bytes!r}]))
@@ -554,6 +557,7 @@ class VideoSpecTests(unittest.TestCase):
             ("fps", Fraction(0), ValueError),
             ("has_audio", "yes", TypeError),
             ("pixel_format", "", ValueError),
+            ("video_start_time", 0.0, TypeError),
         ):
             with self.subTest(field=field, value=value):
                 with self.assertRaises(error):
@@ -585,6 +589,19 @@ class ProbeTests(VideoIOTestCase):
             has_audio=True,
             pixel_format="yuv420p",
         ))
+
+    def test_the_first_decoded_video_pts_is_kept_for_audio_remux(self) -> None:
+        ffprobe = fake_ffprobe(
+            self.bin,
+            streams=report(video_stream(), audio_stream()),
+            timestamps=[1.25 + value for value in uniform_timestamps(4)],
+        )
+        source = self.work / "offset.mkv"
+        source.write_bytes(b"clip")
+
+        spec = probe_cfr_video(source, ffprobe_path=ffprobe)
+
+        self.assertEqual(spec.video_start_time, Fraction(5, 4))
 
     def test_the_scan_decodes_the_selected_stream_instead_of_packets(self) -> None:
         report_file = self.root / "ffprobe.json"
@@ -1057,6 +1074,7 @@ class ProbeTests(VideoIOTestCase):
             ({"pix_fmt": "yuv420p10le", "bits_per_raw_sample": "10"}, "10-bit"),
             ({"pix_fmt": "gbrp12le", "bits_per_raw_sample": None}, "12-bit"),
             ({"pix_fmt": "yuv420p", "bits_per_raw_sample": "10"}, "10-bit"),
+            ({"pix_fmt": "yuv420p", "bits_per_raw_sample": "7"}, "7-bit"),
             ({"pix_fmt": "gbrpf32le", "bits_per_raw_sample": None}, "floating point"),
         )
         for overrides, expected in cases:
@@ -1710,13 +1728,17 @@ class WriterTests(VideoIOTestCase):
         }
         for name, frame in cases.items():
             with self.subTest(case=name):
+                # The prior subtest's pid file must not satisfy await_pid for
+                # this process before it has started reading stdin.
+                (self.root / "ffmpeg.pid").unlink(missing_ok=True)
                 writer = self.writer(1)
                 with self.assertRaises(VideoIOError):
                     with writer as sink:
-                        self.await_pid(self.root / "ffmpeg.pid")
+                        pid = self.await_pid(self.root / "ffmpeg.pid")
                         sink.write(frame)
 
                 self.assertFalse(writer.path.exists())
+                assert_process_gone(pid)
                 self.assertEqual(self.read_report(self.encode_report), {})
 
         assert_process_gone(self.await_pid(self.root / "ffmpeg.pid"))
@@ -2042,6 +2064,37 @@ class RemuxTests(VideoIOTestCase):
         self.assert_file(video_only)
         self.assertNotEqual(video_only, output)
 
+    def test_audio_is_shifted_by_the_video_pts_without_per_input_normalization(self) -> None:
+        report_file = self.root / "remux.json"
+        fake_ffmpeg_remux(self.bin, report_file=report_file)
+        video_only = self.video_only()
+        base = self.spec(2, has_audio=True)
+        spec = VideoSpec(
+            path=base.path,
+            width=base.width,
+            height=base.height,
+            frame_count=base.frame_count,
+            fps=base.fps,
+            has_audio=base.has_audio,
+            pixel_format=base.pixel_format,
+            video_start_time=Fraction(5, 4),
+        )
+
+        remux_audio(
+            spec, video_only, self.work / "final.mkv", ffmpeg_path=self.bin / "ffmpeg"
+        )
+
+        argv = self.read_report(report_file)["argv"]
+        self.assertLess(argv.index("-copyts"), argv.index("-i"))
+        source_input = argv.index(str(spec.path))
+        self.assertEqual(
+            argv[source_input - 3 : source_input], ["-itsoffset", "-1.25", "-i"]
+        )
+        self.assertEqual(
+            argv[argv.index("-avoid_negative_ts") : argv.index("-avoid_negative_ts") + 2],
+            ["-avoid_negative_ts", "make_zero"],
+        )
+
     def test_the_remux_waits_through_a_stderr_flood(self) -> None:
         fake_ffmpeg_remux(
             self.bin, report_file=self.root / "remux.json", stderr_flood=FLOOD_BYTES
@@ -2233,6 +2286,20 @@ class RealFfmpegTests(unittest.TestCase):
         )
         return result.stdout.strip()
 
+    def first_packet_pts(self, path: Path, selector: str) -> Fraction:
+        """The first packet PTS of one stream in a tiny real fixture."""
+        report = self.ffprobe(
+            "-select_streams",
+            selector,
+            "-show_packets",
+            "-show_entries",
+            "packet=pts_time",
+            "-of",
+            "csv=p=0",
+            str(path),
+        )
+        return Fraction(report.splitlines()[0])
+
     def test_probe_is_exact_and_deterministic(self) -> None:
         spec = probe_cfr_video(self.source)
         second = probe_cfr_video(self.source)
@@ -2371,6 +2438,56 @@ class RealFfmpegTests(unittest.TestCase):
         for source_frame, decoded_frame in zip(frames, decoded):
             # Lossy, but the same clip: a frame mix-up would be far larger.
             self.assertLess(float(np.abs(source_frame - decoded_frame).mean()), 0.05)
+
+    def test_round_trip_preserves_audio_that_starts_before_video(self) -> None:
+        source = self.root / "offset_source.mkv"
+        duration = self.FRAMES / self.FPS
+        self.ffmpeg(
+            "-f",
+            "lavfi",
+            "-i",
+            f"testsrc2=size={self.WIDTH}x{self.HEIGHT}:rate={self.FPS}:duration={duration}",
+            "-f",
+            "lavfi",
+            "-i",
+            f"sine=frequency=440:sample_rate=48000:duration={duration + 0.5}",
+            "-vf",
+            "setpts=PTS+1/TB",
+            "-af",
+            "asetpts=PTS+0.5/TB",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "pcm_s16le",
+            str(source),
+        )
+        spec = probe_cfr_video(source)
+        self.assertEqual(spec.video_start_time, Fraction(1))
+        source_offset = (
+            self.first_packet_pts(source, "a:0") - self.first_packet_pts(source, "v:0")
+        )
+        self.assertEqual(source_offset, Fraction(-1, 2))
+
+        video_only = self.root / "offset_video_only.mkv"
+        with FFmpegFrameReader(spec) as reader:
+            with FFmpegFrameWriter(
+                video_only,
+                width=spec.width,
+                height=spec.height,
+                fps=spec.fps,
+                expected_frames=spec.frame_count,
+            ) as writer:
+                for frame in reader:
+                    writer.write(frame)
+
+        final = remux_audio(spec, video_only, self.root / "offset_final.mkv")
+        final_offset = (
+            self.first_packet_pts(final, "a:0") - self.first_packet_pts(final, "v:0")
+        )
+
+        self.assertEqual(final_offset, source_offset)
 
     def test_a_source_without_audio_is_just_moved(self) -> None:
         silent = self.build_source(with_audio=False, name="silent.mp4")

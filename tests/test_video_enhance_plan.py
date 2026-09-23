@@ -4,7 +4,17 @@ import dataclasses
 import unittest
 
 from my_nodes.core.video_enhance.plan import (
+    CUSTOM_NR_PROFILE,
+    GPU_INDEX_RANGE,
+    NR_COLOR_RANGE,
+    NR_DETAIL_RANGE,
+    NR_LOCAL_STRUCTURE_RANGE,
+    NR_LOCAL_TONE_RANGE,
+    NR_PRESETS,
     NR_PROFILES,
+    NR_SKIN_RANGE,
+    NR_STYLES,
+    SR_PRESETS,
     SR_SCALES,
     STAGE_DLSS,
     STAGE_ORDER_DLSS_THEN_VFI,
@@ -55,6 +65,13 @@ class PlanValidationTests(unittest.TestCase):
     def test_unknown_profile_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
             VideoEnhancePlan(enable_neural_rendering=True, nr_profile="cinematic")
+
+    def test_custom_is_appended_after_the_builtin_profiles(self) -> None:
+        # The built-in order is part of the node schema, so `custom` is appended
+        # instead of being inserted anywhere.
+        self.assertEqual(NR_PROFILES[:-1], ("light", "standard", "portrait", "detail"))
+        self.assertEqual(NR_PROFILES[-1], CUSTOM_NR_PROFILE)
+        self.assertEqual(VideoEnhancePlan(nr_profile="custom").nr_profile, "custom")
 
     def test_nr_intensity_range_boundaries(self) -> None:
         self.assertEqual(VideoEnhancePlan(nr_intensity=0.0).nr_intensity, 0.0)
@@ -194,6 +211,106 @@ class PlanStageOrderTests(unittest.TestCase):
                 stage_order=STAGE_ORDER_VFI_THEN_DLSS,
             ),
         )
+
+
+class AdvancedControlTests(unittest.TestCase):
+    """The advanced DLSS controls are validated plan fields, always."""
+
+    def test_defaults_keep_the_existing_behaviour(self) -> None:
+        plan = VideoEnhancePlan()
+        self.assertEqual(plan.nr_style, "Cinematic")
+        self.assertEqual(plan.nr_preset, "Default")
+        self.assertEqual(plan.nr_local_structure, 1.0)
+        self.assertEqual(plan.nr_local_tone, 1.0)
+        self.assertEqual(plan.nr_skin, -1.0)
+        self.assertEqual(plan.nr_detail, 1.0)
+        self.assertEqual(plan.nr_color, 1.0)
+        self.assertIs(plan.nr_ui_correction, False)
+        self.assertIs(plan.nr_auto_mask, False)
+        self.assertEqual(plan.sr_preset, "Default")
+        self.assertEqual(plan.gpu_index, 0)
+        # A plan built without any of them equals one that spells them out.
+        self.assertEqual(plan, VideoEnhancePlan(**{
+            "nr_style": "Cinematic", "nr_preset": "Default", "nr_local_structure": 1.0,
+            "nr_local_tone": 1.0, "nr_skin": -1.0, "nr_detail": 1.0, "nr_color": 1.0,
+            "nr_ui_correction": False, "nr_auto_mask": False, "sr_preset": "Default",
+            "gpu_index": 0,
+        }))
+
+    def test_choice_lists_are_the_documented_ones(self) -> None:
+        self.assertEqual(NR_STYLES, ("Default", "Natural", "Cinematic"))
+        self.assertEqual(NR_PRESETS, ("Default", "Preset 1", "Preset 2", "Preset 3"))
+        self.assertEqual(SR_PRESETS, ("Default", "E", "F", "J", "K", "L", "M"))
+        for style in NR_STYLES:
+            self.assertEqual(VideoEnhancePlan(nr_style=style).nr_style, style)
+        for preset in NR_PRESETS:
+            self.assertEqual(VideoEnhancePlan(nr_preset=preset).nr_preset, preset)
+        for sr_preset in SR_PRESETS:
+            self.assertEqual(VideoEnhancePlan(sr_preset=sr_preset).sr_preset, sr_preset)
+
+    def test_unknown_choices_are_rejected_even_when_disabled(self) -> None:
+        for name, value in (
+            ("nr_style", "cinematic"),
+            ("nr_preset", "Preset 4"),
+            ("sr_preset", "G"),
+        ):
+            with self.subTest(name=name):
+                with self.assertRaises(ValueError):
+                    VideoEnhancePlan(enable_neural_rendering=False, **{name: value})
+
+    def test_numeric_ranges_are_enforced_even_when_disabled(self) -> None:
+        ranges = (
+            ("nr_local_structure", NR_LOCAL_STRUCTURE_RANGE),
+            ("nr_local_tone", NR_LOCAL_TONE_RANGE),
+            ("nr_skin", NR_SKIN_RANGE),
+            ("nr_detail", NR_DETAIL_RANGE),
+            ("nr_color", NR_COLOR_RANGE),
+        )
+        for name, bounds in ranges:
+            low, high = bounds
+            with self.subTest(name=name, value=low):
+                # Both boundaries are values the user can really set.
+                self.assertEqual(getattr(VideoEnhancePlan(**{name: low}), name), float(low))
+            with self.subTest(name=name, value=high):
+                self.assertEqual(getattr(VideoEnhancePlan(**{name: high}), name), float(high))
+            for value in (low - 0.01, high + 0.01):
+                with self.subTest(name=name, value=value):
+                    with self.assertRaises(ValueError):
+                        VideoEnhancePlan(enable_neural_rendering=False, **{name: value})
+
+    def test_gpu_index_range_is_enforced(self) -> None:
+        self.assertEqual(GPU_INDEX_RANGE, (0, 15))
+        self.assertEqual(VideoEnhancePlan(gpu_index=15).gpu_index, 15)
+        for value in (-1, 16):
+            with self.subTest(gpu_index=value):
+                with self.assertRaises(ValueError):
+                    VideoEnhancePlan(enable_super_resolution=False, gpu_index=value)
+
+    def test_wrong_advanced_types_are_rejected(self) -> None:
+        with self.assertRaises(TypeError):
+            VideoEnhancePlan(nr_ui_correction=1)
+        with self.assertRaises(TypeError):
+            VideoEnhancePlan(nr_auto_mask=0)
+        with self.assertRaises(TypeError):
+            VideoEnhancePlan(nr_detail="1.0")
+        with self.assertRaises(TypeError):
+            VideoEnhancePlan(nr_style=2)
+        with self.assertRaises(TypeError):
+            VideoEnhancePlan(sr_preset=None)
+        with self.assertRaises(TypeError):
+            VideoEnhancePlan(gpu_index=1.0)
+        with self.assertRaises(TypeError):
+            VideoEnhancePlan(gpu_index=True)
+
+    def test_advanced_numbers_are_normalized_for_plan_equality(self) -> None:
+        left = VideoEnhancePlan(nr_detail=1, nr_color=1, gpu_index=0)
+        right = VideoEnhancePlan(nr_detail=1.0, nr_color=1.0, gpu_index=0)
+        self.assertEqual(left, right)
+        self.assertIsInstance(left.nr_detail, float)
+        # A different advanced value is a different plan, so it cannot be
+        # silently dropped from a cache key or a comparison.
+        self.assertNotEqual(left, VideoEnhancePlan(nr_detail=1.5))
+        self.assertNotEqual(left, VideoEnhancePlan(gpu_index=1))
 
 
 if __name__ == "__main__":

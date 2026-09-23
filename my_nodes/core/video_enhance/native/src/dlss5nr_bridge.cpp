@@ -21,6 +21,12 @@
 // never pass the host's export check.
 // The caller shim is loaded from the directory of this bridge, not from the
 // user's NVIDIA runtime directory.
+//
+// Modified for the DNR3 advanced controls (0.6.0): the session's SR render
+// preset hint is applied to the ordinary feature-1 carrier, and an active
+// neural post-pass with a non-default detail/color strength composites the
+// pre-NR frame against the feature-18 result on the readback path.  Both
+// controls arrive through the environment, so the wire protocol is unchanged.
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -61,6 +67,21 @@ static constexpr int NR_POSTPASS_PERF_QUALITY = 6;
 static constexpr unsigned long long APP_ID = 141959980ULL;
 static constexpr unsigned long long GENERIC_APP_ID = 0x24480451ULL;
 static constexpr const char* PROJECT_ID = "53f803cc-a12f-4d69-90d5-19b7599cad19";
+
+// DLSS5NR_SR_PRESET carries the NGX render-preset hint for the ordinary
+// feature-1 carrier (0 = Default, 13 = PresetM, the newest hint the enum
+// defines).  The Python UI offers exactly the values inside this range.
+static constexpr int SR_PRESET_DEFAULT = 0;
+static constexpr int SR_PRESET_MAX = 13;
+// DLSS5NR_DETAIL / DLSS5NR_COLOR are the video2dlssnr strengths: detail is the
+// overall blend against the pre-NR frame, color the blend from the pre-NR hue
+// (carried to the neural luminance) towards the neural color.
+static constexpr float DETAIL_DEFAULT = 1.0f;
+static constexpr float DETAIL_MAX = 2.0f;
+static constexpr float COLOR_DEFAULT = 1.0f;
+static constexpr float COLOR_MAX = 1.0f;
+// DLSS5NR_CHANNEL_ORDER names how the feature-18 readback is stored.
+enum ChannelOrderHint { CHANNEL_ORDER_AUTO = 0, CHANNEL_ORDER_RGBA, CHANNEL_ORDER_BGRA };
 
 struct NGXHandle { unsigned int Id; };
 
@@ -177,6 +198,10 @@ static ComPtr<ID3D12Resource> g_color_upload;
 static ComPtr<ID3D12Resource> g_mvec_upload;
 static ComPtr<ID3D12Resource> g_depth_upload;
 static ComPtr<ID3D12Resource> g_output_readback;
+// Second readback holding the pre-NR frame of the same submission.  It only
+// exists while a composite is active, so the default path allocates and copies
+// exactly what it always did.
+static ComPtr<ID3D12Resource> g_baseline_readback;
 static UINT g_input_width = 0, g_input_height = 0;
 static UINT g_output_width = 0, g_output_height = 0;
 static UINT g_color_row_pitch = 0, g_mvec_row_pitch = 0, g_depth_row_pitch = 0, g_output_row_pitch = 0;
@@ -194,6 +219,22 @@ static int g_float_set_slot = -1;
 static int g_uint_set_slot = 3;
 static bool g_capability_params = false;
 static bool g_hdr_requested = false;
+
+// Advanced controls.  They are launch-time environment values (the DNR3 wire
+// protocol has no field for them and must not grow one), read once by
+// ParseSessionControls() so every frame of a session sees the same strengths.
+static float g_detail_strength = DETAIL_DEFAULT;
+static float g_color_strength = COLOR_DEFAULT;
+static int g_sr_render_preset = SR_PRESET_DEFAULT;
+static int g_channel_order_hint = CHANNEL_ORDER_AUTO;
+// True only when a frame actually has a pre-NR frame to composite against:
+// neural rendering runs and the caller asked for something other than the
+// untouched neural result.  The default strengths therefore keep the raw
+// readback path (and its allocations) exactly as they were.
+static bool g_composite_active = false;
+// Raw channel order of the feature-18 output, resolved once per resource
+// lifetime for `auto`: -1 = not decided yet, 0 = R,G,B, 1 = B,G,R.
+static int g_auto_raw_bgra = -1;
 
 static unsigned long long EnvU64(const char* name, unsigned long long fallback) {
     char buf[128] = {};
@@ -217,6 +258,26 @@ static std::string EnvString(const char* name, const char* fallback) {
     char buf[512] = {};
     DWORD n = GetEnvironmentVariableA(name, buf, static_cast<DWORD>(sizeof(buf)));
     return n == 0 || n >= sizeof(buf) ? std::string(fallback) : std::string(buf, n);
+}
+
+// A strength is only meaningful as a finite number inside its documented
+// range.  A hand-written launch that sets something else (unparsable, NaN,
+// inf) falls back to the neutral default instead of aborting a frame.
+static float EnvFloat(const char* name, float fallback, float lo, float hi) {
+    char buf[64] = {};
+    const DWORD n = GetEnvironmentVariableA(name, buf, static_cast<DWORD>(sizeof(buf)));
+    if (n == 0 || n >= sizeof(buf)) return fallback;
+    char* end = nullptr;
+    const float value = strtof(buf, &end);
+    if (end == buf || !std::isfinite(value)) {
+        std::fprintf(stderr, "[dlss5nr] ignoring malformed %s=%s, using %g\n", name, buf, fallback);
+        return fallback;
+    }
+    const float clamped = std::clamp(value, lo, hi);
+    if (clamped != value) {
+        std::fprintf(stderr, "[dlss5nr] clamping out-of-range %s=%g to %g\n", name, value, clamped);
+    }
+    return clamped;
 }
 
 static void __cdecl NGXLog(const char* message, NGXLoggingLevel level, int source) {
@@ -554,6 +615,90 @@ static float HalfToFloat(uint16_t h) {
     float f; memcpy(&f, &x, sizeof(f)); return f;
 }
 
+// ---------------------------------------------------------------------------
+// Post-NR compositing (DLSS5NR_DETAIL / DLSS5NR_COLOR)
+//
+// The bridge readback is the raw feature-18 result.  When the caller asked for
+// a detail/color strength other than 1 it wants the pre-NR frame of the same
+// submission blended in, exactly like video2dlssnr v1.4.1 does for SDR video.
+// The blend runs on the CPU over the two readbacks the frame already waits
+// for; that keeps the bridge free of any shader compiler or runtime and costs
+// nothing when the defaults are in use.
+
+// video2dlssnr v1.4.1 sRGB transfer functions (src/image.cpp).
+static float SrgbToLinear(float c) {
+    return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f);
+}
+
+static float LinearToSrgb(float c) {
+    if (c <= 0.0f) return 0.0f;
+    if (c <= 0.0031308f) return c * 12.92f;
+    return 1.055f * std::pow(c, 1.0f / 2.4f) - 0.055f;
+}
+
+// The pre-NR frame this session composites over, and the same surface feature
+// 18 consumed as DLSSNR.Color: the uploaded input for neural rendering alone
+// (validated to run at native resolution), the feature-1 result for SR/DLAA
+// followed by neural rendering.  Both are logical RGB in channels 0..2.
+static ID3D12Resource* BaselineTexture() {
+    return g_sr_enabled ? g_dlss_output.Get() : g_color.Get();
+}
+
+// video2dlssnr v1.4.1 SDR compositing (src/nr.cpp Composite / kCompositeHlsl
+// gMode == 0), per pixel and in logical RGB:
+//   orig/nr = sRGB decoded to linear, Rec.709 luma for both
+//   scale = nr_luma / max(orig_luma, 1e-4)
+//   orig_hue_at_nr_luma = orig * scale
+//   colored = orig_hue_at_nr_luma + (nr - orig_hue_at_nr_luma) * color
+//   result = orig + (colored - orig) * detail
+// and the linear result is re-encoded to sRGB and clamped to [0,1].
+static void CompositeSdr(float* out, const float* baseline, const float* neural, float detail, float color) {
+    float orig[3], nr[3];
+    for (int c = 0; c < 3; ++c) {
+        orig[c] = SrgbToLinear(baseline[c]);
+        nr[c] = SrgbToLinear(neural[c]);
+    }
+    const float orig_luma = 0.2126f * orig[0] + 0.7152f * orig[1] + 0.0722f * orig[2];
+    const float nr_luma = 0.2126f * nr[0] + 0.7152f * nr[1] + 0.0722f * nr[2];
+    const float scale = nr_luma / std::max(orig_luma, 1e-4f);
+    for (int c = 0; c < 3; ++c) {
+        const float orig_hue_at_nr_luma = orig[c] * scale;
+        const float colored = orig_hue_at_nr_luma + (nr[c] - orig_hue_at_nr_luma) * color;
+        out[c] = std::clamp(LinearToSrgb(orig[c] + (colored - orig[c]) * detail), 0.0f, 1.0f);
+    }
+}
+
+// Some builds store the feature-18 result as B,G,R,A and some as R,G,B,A.
+// `auto` picks between the two once per resource lifetime by comparing the raw
+// readback against the pre-NR baseline - the same sum-of-absolute-errors
+// decision the Python stage makes on a first input/output pair - and the result
+// is cached until the feature or its resources are rebuilt.
+static void ResolveAutoChannelOrder(const uint8_t* baseline_rows, const uint8_t* raw_rows, int width, int height) {
+    double direct = 0.0, swapped = 0.0;
+    for (int y = 0; y < height; ++y) {
+        const auto* b = reinterpret_cast<const uint16_t*>(baseline_rows + static_cast<size_t>(y) * g_output_row_pitch);
+        const auto* n = reinterpret_cast<const uint16_t*>(raw_rows + static_cast<size_t>(y) * g_output_row_pitch);
+        for (int x = 0; x < width; ++x) {
+            const float b0 = HalfToFloat(b[x * 4 + 0]), b1 = HalfToFloat(b[x * 4 + 1]), b2 = HalfToFloat(b[x * 4 + 2]);
+            const float n0 = HalfToFloat(n[x * 4 + 0]), n1 = HalfToFloat(n[x * 4 + 1]), n2 = HalfToFloat(n[x * 4 + 2]);
+            direct += std::fabs(n0 - b0) + std::fabs(n1 - b1) + std::fabs(n2 - b2);
+            swapped += std::fabs(n2 - b0) + std::fabs(n1 - b1) + std::fabs(n0 - b2);
+        }
+    }
+    g_auto_raw_bgra = swapped < direct ? 1 : 0;
+    std::fprintf(stderr, "[dlss5nr] composite channel order (auto) resolved: %s (direct=%.3f swapped=%.3f)\n",
+                 g_auto_raw_bgra ? "BGRA" : "RGBA", direct, swapped);
+    std::fflush(stderr);
+}
+
+// Raw channel order of the feature-18 output.  An explicit request is honoured
+// as-is, `auto` uses the detection above.
+static bool RawOutputIsBgra() {
+    if (g_channel_order_hint == CHANNEL_ORDER_BGRA) return true;
+    if (g_channel_order_hint == CHANNEL_ORDER_RGBA) return false;
+    return g_auto_raw_bgra > 0;
+}
+
 static void ReleaseFeatureAndResources() {
     WaitQueueIdle();
     if (g_feature) {
@@ -567,6 +712,7 @@ static void ReleaseFeatureAndResources() {
     }
     g_color.Reset(); g_mvec.Reset(); g_depth.Reset(); g_dlss_output.Reset(); g_output.Reset();
     g_color_upload.Reset(); g_mvec_upload.Reset(); g_depth_upload.Reset(); g_output_readback.Reset();
+    g_baseline_readback.Reset();
     g_input_width = g_input_height = 0;
     g_output_width = g_output_height = 0;
     g_color_row_pitch = g_mvec_row_pitch = g_depth_row_pitch = g_output_row_pitch = 0;
@@ -577,6 +723,9 @@ static void ReleaseFeatureAndResources() {
     g_feature_style = -999; g_feature_preset = -999;
     g_feature_perf_quality = -999;
     g_hdr_requested = false;
+    // The raw channel order belongs to the resources that were just released,
+    // so the next build resolves it again from the actual readback.
+    g_auto_raw_bgra = -1;
 }
 
 // The frame this session has to read back: neural rendering owns its own
@@ -635,6 +784,16 @@ static bool AllocateFrameResources(UINT input_w, UINT input_h, UINT output_w, UI
     if (!g_color_upload || !g_mvec_upload || !g_depth_upload || !g_output_readback) {
         SetError("Failed to create DLSSNR upload/readback buffers"); return false;
     }
+    // The baseline readback is the second, optional surface of a compositing
+    // session.  It is created here (the size is known, and the frames of this
+    // session all share it) but only when a composite will actually read it:
+    // with the default detail/color nothing extra is allocated or copied.
+    if (g_composite_active) {
+        g_baseline_readback = CreateLinearBuffer(g_output_bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+        if (!g_baseline_readback) {
+            SetError("Failed to create the pre-NR baseline readback buffer"); return false;
+        }
+    }
     g_input_width = input_w; g_input_height = input_h;
     g_output_width = output_w; g_output_height = output_h;
     return true;
@@ -644,6 +803,47 @@ static bool EnvFlagEnabled(const char* name) {
     char buf[8] = {};
     const DWORD n = GetEnvironmentVariableA(name, buf, sizeof(buf));
     return n > 0 && n < sizeof(buf) && buf[0] == '1';
+}
+
+// The DNR3 protocol carries the launch-time controls in the environment, not in
+// the header, so they are parsed exactly once per initialized session: every
+// frame of one worker sees the same strengths, preset and channel order, and a
+// session can never be half-switched midway.
+static void ParseSessionControls() {
+    g_detail_strength = EnvFloat("DLSS5NR_DETAIL", DETAIL_DEFAULT, 0.0f, DETAIL_MAX);
+    g_color_strength = EnvFloat("DLSS5NR_COLOR", COLOR_DEFAULT, 0.0f, COLOR_MAX);
+
+    // Anything outside the hint enum is a caller bug; Default keeps the
+    // carrier at the runtime's own choice instead of picking an unintended
+    // model.  This is the preset the Python UI names "Default".
+    const int preset = EnvInt("DLSS5NR_SR_PRESET", SR_PRESET_DEFAULT);
+    if (preset < 0 || preset > SR_PRESET_MAX) {
+        std::fprintf(stderr, "[dlss5nr] ignoring out-of-range DLSS5NR_SR_PRESET=%d, using Default\n", preset);
+        g_sr_render_preset = SR_PRESET_DEFAULT;
+    } else {
+        g_sr_render_preset = preset;
+    }
+
+    const std::string order = EnvString("DLSS5NR_CHANNEL_ORDER", "auto");
+    if (order == "RGBA") {
+        g_channel_order_hint = CHANNEL_ORDER_RGBA;
+    } else if (order == "BGRA") {
+        g_channel_order_hint = CHANNEL_ORDER_BGRA;
+    } else {
+        if (order != "auto") {
+            std::fprintf(stderr, "[dlss5nr] unknown DLSS5NR_CHANNEL_ORDER=%s, using auto\n", order.c_str());
+        }
+        g_channel_order_hint = CHANNEL_ORDER_AUTO;
+    }
+
+    // Compositing needs feature 18 to have produced a result and a caller that
+    // asked for something other than that result.  Both defaults together keep
+    // the raw readback path byte-identical for existing callers.
+    g_composite_active = g_nr_enabled && (g_detail_strength != DETAIL_DEFAULT || g_color_strength != COLOR_DEFAULT);
+    std::fprintf(stderr,
+                 "[dlss5nr] advanced controls: detail=%g color=%g sr_preset=%d channel_order=%s composite=%d\n",
+                 g_detail_strength, g_color_strength, g_sr_render_preset, order.c_str(),
+                 g_composite_active ? 1 : 0);
 }
 
 static void SetDLSSCarrierParams(int perf_quality, int reset) {
@@ -664,6 +864,19 @@ static void SetDLSSCarrierParams(int perf_quality, int reset) {
     SetParamUInt("ResourceOutWidth", g_output_width);
     SetParamUInt("ResourceOutHeight", g_output_height);
     SetParamUInt("PerfQualityValue", static_cast<unsigned int>(std::max(0, perf_quality)));
+
+    // DLSS5NR_SR_PRESET: the model the carrier runs with, offered to the
+    // runtime on every render-preset key.  The ordinary carrier selects the
+    // key matching its own mode - the DLAA key for a native-size session, the
+    // quality key for an enlargement - and setting all six keeps that choice
+    // deterministic instead of leaving it at a per-driver default.  All six
+    // are in place before CreateFeature runs.
+    SetParamUInt("DLSS.Hint.Render.Preset.DLAA", static_cast<unsigned int>(g_sr_render_preset));
+    SetParamUInt("DLSS.Hint.Render.Preset.UltraQuality", static_cast<unsigned int>(g_sr_render_preset));
+    SetParamUInt("DLSS.Hint.Render.Preset.Quality", static_cast<unsigned int>(g_sr_render_preset));
+    SetParamUInt("DLSS.Hint.Render.Preset.Balanced", static_cast<unsigned int>(g_sr_render_preset));
+    SetParamUInt("DLSS.Hint.Render.Preset.Performance", static_cast<unsigned int>(g_sr_render_preset));
+    SetParamUInt("DLSS.Hint.Render.Preset.UltraPerformance", static_cast<unsigned int>(g_sr_render_preset));
 
     // A video frame has no depth buffer, but DLSS still requires the resource
     // and the feature-create flags.  The bridge uploads a constant R32_FLOAT
@@ -1172,12 +1385,18 @@ static void ShutdownUnlocked() {
     g_sr_enabled = false;
     g_nr_enabled = false;
     g_initialized = false;
+    g_detail_strength = DETAIL_DEFAULT;
+    g_color_strength = COLOR_DEFAULT;
+    g_sr_render_preset = SR_PRESET_DEFAULT;
+    g_channel_order_hint = CHANNEL_ORDER_AUTO;
+    g_composite_active = false;
+    g_auto_raw_bgra = -1;
 }
 
 extern "C" {
 
 __declspec(dllexport) const char* __cdecl dlss5nr_version() {
-    return "0.5.0-dnr3-feature-flags";
+    return "0.6.0-dnr3-advanced-controls";
 }
 
 __declspec(dllexport) const char* __cdecl dlss5nr_gpu_name() {
@@ -1214,6 +1433,10 @@ __declspec(dllexport) int __cdecl dlss5nr_init3(int gpu_index, const wchar_t* ru
     g_nr_enabled = (features & FEATURE_NR) != 0;
     g_gpu_index = gpu_index;
     g_runtime_dir = runtime_dir;
+    // The advanced controls are launch-time environment values, so they are
+    // read once here, after the feature bits are known: one initialized bridge
+    // serves one feature combination with one set of strengths.
+    ParseSessionControls();
     HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     (void)co; // RPC_E_CHANGED_MODE is harmless for this use.
 
@@ -1415,6 +1638,40 @@ static int ProcessFrame(
     // SR+NR leaves it as a shader resource for the next feature-1 evaluate.
     ID3D12Resource* result = OutputTexture();
     if (!result) { SetError("no output texture is available for this feature combination"); CopyError(err, err_cap); return 0; }
+
+    // A composite needs the pre-NR frame of this very submission. It is copied
+    // into its own readback on the same command list, so one wait still covers
+    // both surfaces and the neural result itself is never re-run or re-blended
+    // across frames.
+    if (g_composite_active) {
+        ID3D12Resource* baseline = BaselineTexture();
+        const UINT baseline_width = g_sr_enabled ? g_output_width : g_input_width;
+        const UINT baseline_height = g_sr_enabled ? g_output_height : g_input_height;
+        // NR without SR is validated to run at native resolution, so the
+        // baseline surface always matches the output footprint.
+        if (!baseline || !g_baseline_readback ||
+            baseline_width != g_output_width || baseline_height != g_output_height) {
+            SetError("cannot composite: the pre-NR baseline is unavailable at the output size");
+            CopyError(err, err_cap); return 0;
+        }
+        // Both session layouts leave the baseline as a shader resource at this
+        // point: feature 18 consumed it (SR+NR) or the frame upload restored it.
+        auto b2 = Barrier(baseline, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                          D3D12_RESOURCE_STATE_COPY_SOURCE);
+        g_cmd->ResourceBarrier(1, &b2);
+        D3D12_TEXTURE_COPY_LOCATION bd{};
+        bd.pResource = g_baseline_readback.Get(); bd.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        bd.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        bd.PlacedFootprint.Footprint.Width = static_cast<UINT>(output_width);
+        bd.PlacedFootprint.Footprint.Height = static_cast<UINT>(output_height);
+        bd.PlacedFootprint.Footprint.Depth = 1; bd.PlacedFootprint.Footprint.RowPitch = g_output_row_pitch;
+        D3D12_TEXTURE_COPY_LOCATION bs{};
+        bs.pResource = baseline; bs.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        g_cmd->CopyTextureRegion(&bd, 0, 0, 0, &bs, nullptr);
+        auto b2b = Barrier(baseline, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        g_cmd->ResourceBarrier(1, &b2b);
+    }
     auto b3 = Barrier(result, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
     g_cmd->ResourceBarrier(1, &b3);
     D3D12_TEXTURE_COPY_LOCATION rd{};
@@ -1435,19 +1692,62 @@ static int ProcessFrame(
     hr = g_output_readback->Map(0, nullptr, &rmap);
     if (FAILED(hr) || !rmap) { SetError("Readback Map failed: 0x%08X", static_cast<unsigned>(hr)); CopyError(err, err_cap); return 0; }
     const auto* base = static_cast<const uint8_t*>(rmap);
+
+    const uint8_t* baseline_base = nullptr;
+    if (g_composite_active) {
+        void* bmap = nullptr;
+        hr = g_baseline_readback->Map(0, nullptr, &bmap);
+        if (FAILED(hr) || !bmap) {
+            g_output_readback->Unmap(0, nullptr);
+            SetError("Pre-NR baseline readback Map failed: 0x%08X", static_cast<unsigned>(hr));
+            CopyError(err, err_cap); return 0;
+        }
+        baseline_base = static_cast<const uint8_t*>(bmap);
+        // `auto` resolves itself on the first composited frame of this resource
+        // lifetime; an explicit RGBA/BGRA request was already parsed at init.
+        if (g_channel_order_hint == CHANNEL_ORDER_AUTO && g_auto_raw_bgra < 0) {
+            ResolveAutoChannelOrder(baseline_base, base, output_width, output_height);
+        }
+    }
+    // Only a composite may reinterpret the readback: with the default
+    // detail/color the channels are returned exactly as stored, byte for byte,
+    // and Python keeps applying the order it selected.
+    const bool raw_bgra = g_composite_active && RawOutputIsBgra();
+
     for (int y = 0; y < output_height; ++y) {
         const auto* row = reinterpret_cast<const uint16_t*>(base + static_cast<size_t>(y) * g_output_row_pitch);
+        const auto* brow = baseline_base
+            ? reinterpret_cast<const uint16_t*>(baseline_base + static_cast<size_t>(y) * g_output_row_pitch)
+            : nullptr;
         float* dstf = rgb_out + static_cast<size_t>(y) * output_width * 3;
         for (int x = 0; x < output_width; ++x) {
             // Return the resource channels exactly as stored. Some stock/reference
             // DLSSNR builds have been observed to produce B,G,R,A while patched
             // Ada builds may produce R,G,B,A. Python selects/auto-detects the
             // correct interpretation instead of hard-coding a swap here.
-            dstf[x * 3 + 0] = std::clamp(HalfToFloat(row[x * 4 + 0]), 0.0f, 1.0f);
-            dstf[x * 3 + 1] = std::clamp(HalfToFloat(row[x * 4 + 1]), 0.0f, 1.0f);
-            dstf[x * 3 + 2] = std::clamp(HalfToFloat(row[x * 4 + 2]), 0.0f, 1.0f);
+            const float raw0 = HalfToFloat(row[x * 4 + 0]);
+            const float raw1 = HalfToFloat(row[x * 4 + 1]);
+            const float raw2 = HalfToFloat(row[x * 4 + 2]);
+            float out[3] = { raw0, raw1, raw2 };
+            if (g_composite_active) {
+                const float neural[3] = { raw_bgra ? raw2 : raw0, raw1, raw_bgra ? raw0 : raw2 };
+                const float baseline[3] = {
+                    HalfToFloat(brow[x * 4 + 0]), HalfToFloat(brow[x * 4 + 1]), HalfToFloat(brow[x * 4 + 2]) };
+                CompositeSdr(out, baseline, neural, g_detail_strength, g_color_strength);
+            } else {
+                out[0] = std::clamp(out[0], 0.0f, 1.0f);
+                out[1] = std::clamp(out[1], 0.0f, 1.0f);
+                out[2] = std::clamp(out[2], 0.0f, 1.0f);
+            }
+            // A composite is written back in the raw order feature 18 produced,
+            // so the caller's channel handling stays exactly the same. That also
+            // holds for detail=0, which emits the pre-NR frame itself.
+            dstf[x * 3 + 0] = raw_bgra ? out[2] : out[0];
+            dstf[x * 3 + 1] = out[1];
+            dstf[x * 3 + 2] = raw_bgra ? out[0] : out[2];
         }
     }
+    if (baseline_base) g_baseline_readback->Unmap(0, nullptr);
     g_output_readback->Unmap(0, nullptr);
     CopyError(err, err_cap);
     return 1;

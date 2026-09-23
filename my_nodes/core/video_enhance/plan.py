@@ -13,9 +13,27 @@ from dataclasses import dataclass
 
 # 1.0 is native-resolution DLAA (feature 1, perf_quality 5), not a no-op.
 SR_SCALES: tuple[float, ...] = (1.0, 1.5, 2.0, 3.0)
-NR_PROFILES: tuple[str, ...] = ("light", "standard", "portrait", "detail")
+# `custom` is the last choice: every built-in profile keeps its own fixed model
+# fields, so it resolves exactly as before and only `custom` reads the
+# advanced fields below.
+NR_PROFILES: tuple[str, ...] = ("light", "standard", "portrait", "detail", "custom")
+CUSTOM_NR_PROFILE: str = "custom"
 INTERPOLATION_FACTORS: tuple[int, ...] = (2,)
 NR_INTENSITY_RANGE: tuple[float, float] = (0.0, 2.0)
+
+# Advanced neural-rendering controls. The strings are the user-facing choices;
+# the profile resolver maps them onto the integer model selectors.
+NR_STYLES: tuple[str, ...] = ("Default", "Natural", "Cinematic")
+NR_PRESETS: tuple[str, ...] = ("Default", "Preset 1", "Preset 2", "Preset 3")
+NR_LOCAL_STRUCTURE_RANGE: tuple[float, float] = (0.0, 2.0)
+NR_LOCAL_TONE_RANGE: tuple[float, float] = (0.0, 2.0)
+NR_SKIN_RANGE: tuple[float, float] = (-1.0, 2.0)
+NR_DETAIL_RANGE: tuple[float, float] = (0.0, 2.0)
+NR_COLOR_RANGE: tuple[float, float] = (0.0, 1.0)
+# DLSS super-resolution preset. `Default` leaves the runtime default in place,
+# the letters are the model selector a specific DLSS release pins.
+SR_PRESETS: tuple[str, ...] = ("Default", "E", "F", "J", "K", "L", "M")
+GPU_INDEX_RANGE: tuple[int, int] = (0, 15)
 
 STAGE_DLSS: str = "dlss"
 STAGE_VFI: str = "vfi"
@@ -54,6 +72,30 @@ def _require_str(value: object, name: str) -> str:
     return value
 
 
+def _require_in_range(value: object, name: str, bounds: tuple[float, float]) -> float:
+    """A finite number inside the closed `bounds` interval."""
+    number = _require_number(value, name)
+    if not bounds[0] <= number <= bounds[1]:
+        raise ValueError(f"{name} must be within {bounds}, got {value!r}")
+    return number
+
+
+def _require_int_in_range(value: object, name: str, bounds: tuple[int, int]) -> int:
+    """An int inside the closed `bounds` interval (a bool is never an int)."""
+    number = _require_int(value, name)
+    if not bounds[0] <= number <= bounds[1]:
+        raise ValueError(f"{name} must be within {bounds}, got {value!r}")
+    return number
+
+
+def _require_choice(value: object, name: str, choices: tuple[str, ...]) -> str:
+    """A string that is one of `choices`."""
+    selected = _require_str(value, name)
+    if selected not in choices:
+        raise ValueError(f"{name} must be one of {choices}, got {selected!r}")
+    return selected
+
+
 @dataclass(frozen=True)
 class VideoEnhancePlan:
     """Validated, immutable description of one video-enhance execution.
@@ -68,6 +110,14 @@ class VideoEnhancePlan:
     (super resolution and neural rendering) first and interpolates its output,
     the alternative interpolates first and enhances the interpolated frames.
     When a single stage is active its order is not ambiguous and unchanged.
+
+    The advanced neural-rendering controls (`nr_style`, `nr_preset`,
+    `nr_local_structure`, `nr_local_tone`, `nr_skin`, `nr_auto_mask`,
+    `nr_ui_correction`) are read only by the `custom` profile; every built-in
+    profile keeps its own fixed model fields. `nr_detail` and `nr_color` are the
+    post-neural-rendering composite controls and apply whenever neural rendering
+    runs, their defaults preserving the raw model output. `sr_preset` and
+    `gpu_index` belong to the super-resolution and launch paths.
     """
 
     enable_super_resolution: bool = False
@@ -75,6 +125,17 @@ class VideoEnhancePlan:
     enable_neural_rendering: bool = False
     nr_profile: str = "standard"
     nr_intensity: float = 1.0
+    nr_style: str = "Cinematic"
+    nr_preset: str = "Default"
+    nr_local_structure: float = 1.0
+    nr_local_tone: float = 1.0
+    nr_skin: float = -1.0
+    nr_detail: float = 1.0
+    nr_color: float = 1.0
+    nr_ui_correction: bool = False
+    nr_auto_mask: bool = False
+    sr_preset: str = "Default"
+    gpu_index: int = 0
     enable_frame_interpolation: bool = False
     interpolation_factor: int = 2
     stage_order: str = STAGE_ORDER_DLSS_THEN_VFI
@@ -85,27 +146,46 @@ class VideoEnhancePlan:
         if scale not in SR_SCALES:
             raise ValueError(f"sr_scale must be one of {SR_SCALES}, got {self.sr_scale!r}")
         _require_bool(self.enable_neural_rendering, "enable_neural_rendering")
-        profile = _require_str(self.nr_profile, "nr_profile")
-        if profile not in NR_PROFILES:
-            raise ValueError(f"nr_profile must be one of {NR_PROFILES}, got {profile!r}")
-        intensity = _require_number(self.nr_intensity, "nr_intensity")
-        if not NR_INTENSITY_RANGE[0] <= intensity <= NR_INTENSITY_RANGE[1]:
-            raise ValueError(
-                f"nr_intensity must be within {NR_INTENSITY_RANGE}, got {self.nr_intensity!r}"
-            )
+        profile = _require_choice(self.nr_profile, "nr_profile", NR_PROFILES)
+        intensity = _require_in_range(self.nr_intensity, "nr_intensity", NR_INTENSITY_RANGE)
+        # Every advanced control is validated even when neural rendering is off,
+        # so the plan stays the one serializable description of the execution.
+        style = _require_choice(self.nr_style, "nr_style", NR_STYLES)
+        preset = _require_choice(self.nr_preset, "nr_preset", NR_PRESETS)
+        structure = _require_in_range(
+            self.nr_local_structure, "nr_local_structure", NR_LOCAL_STRUCTURE_RANGE
+        )
+        tone = _require_in_range(self.nr_local_tone, "nr_local_tone", NR_LOCAL_TONE_RANGE)
+        skin = _require_in_range(self.nr_skin, "nr_skin", NR_SKIN_RANGE)
+        detail = _require_in_range(self.nr_detail, "nr_detail", NR_DETAIL_RANGE)
+        color = _require_in_range(self.nr_color, "nr_color", NR_COLOR_RANGE)
+        _require_bool(self.nr_ui_correction, "nr_ui_correction")
+        _require_bool(self.nr_auto_mask, "nr_auto_mask")
+        sr_preset = _require_choice(self.sr_preset, "sr_preset", SR_PRESETS)
+        gpu_index = _require_int_in_range(self.gpu_index, "gpu_index", GPU_INDEX_RANGE)
         _require_bool(self.enable_frame_interpolation, "enable_frame_interpolation")
         factor = _require_int(self.interpolation_factor, "interpolation_factor")
         if factor not in INTERPOLATION_FACTORS:
             raise ValueError(
                 f"interpolation_factor must be one of {INTERPOLATION_FACTORS}, got {factor!r}"
             )
-        order = _require_str(self.stage_order, "stage_order")
-        if order not in STAGE_ORDERS:
-            raise ValueError(f"stage_order must be one of {STAGE_ORDERS}, got {order!r}")
+        order = _require_choice(self.stage_order, "stage_order", STAGE_ORDERS)
         # Normalize numbers so equal settings always produce equal plans.
-        object.__setattr__(self, "sr_scale", scale)
-        object.__setattr__(self, "nr_intensity", intensity)
-        object.__setattr__(self, "stage_order", order)
+        for name, value in (
+            ("sr_scale", scale),
+            ("nr_intensity", intensity),
+            ("nr_style", style),
+            ("nr_preset", preset),
+            ("nr_local_structure", structure),
+            ("nr_local_tone", tone),
+            ("nr_skin", skin),
+            ("nr_detail", detail),
+            ("nr_color", color),
+            ("sr_preset", sr_preset),
+            ("gpu_index", gpu_index),
+            ("stage_order", order),
+        ):
+            object.__setattr__(self, name, value)
 
     @property
     def uses_dlss(self) -> bool:

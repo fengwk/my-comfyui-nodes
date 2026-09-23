@@ -15,7 +15,7 @@ Vendored files, and what changed:
 
 | File | Changes |
 | --- | --- |
-| `src/dlss5nr_bridge.cpp` | Adapted for DNR3: header/feature handling, feature-gated NGX loading, new exports, shim loaded next to the bridge. |
+| `src/dlss5nr_bridge.cpp` | Adapted for DNR3: header/feature handling, feature-gated NGX loading, new exports, shim loaded next to the bridge, environment-driven SR preset and post-NR detail/color compositing. |
 | `src/dlss5nr_host.cpp` | Adapted for DNR3: `DNR3` magic, feature field, feature-flag validation, feature-aware init call, new bridge export check. |
 | `src/caller_shim.cpp` | Unmodified except the provenance comment. |
 | `build_mingw.sh` | New in this repository: builds bridge, host and shim (upstream's `src/build_host_mingw.sh` only built the first two). |
@@ -47,7 +47,18 @@ Vendored files, and what changed:
 - Exports removed: `dlss5nr_init`, `dlss5nr_process` (legacy image ABI) and
   `dlss5nr_process_v2`, all replaced by `dlss5nr_init3` / `dlss5nr_process_v3`,
   so a stale DNR2 bridge is rejected instead of silently ignoring requests.
-- `dlss5nr_version()` reports `0.5.0-dnr3-feature-flags`.
+- `dlss5nr_version()` reports `0.6.0-dnr3-advanced-controls`.
+- The launch-time advanced controls reach the bridge through the environment,
+  never through the wire: `DLSS5NR_SR_PRESET` is applied to all six
+  `DLSS.Hint.Render.Preset.*` keys of the ordinary feature-1 carrier (DLAA and
+  SR alike), and `DLSS5NR_DETAIL` / `DLSS5NR_COLOR` blend the pre-NR frame of
+  the same submission (`g_color` for neural rendering alone, the feature-1
+  output for SR/DLAA + NR) into the feature-18 result on the CPU readback path.
+  Both strengths default to 1, which keeps the previous raw readback (and its
+  allocations) untouched; `DLSS5NR_CHANNEL_ORDER` names the raw output order
+  (`auto` detects it once per resource lifetime). The SDR compositing formula
+  was reimplemented from `video2dlssnr` v1.4.1 (no code of that project is
+  vendored here).
 
 `src/dlss5nr_host.cpp`
 

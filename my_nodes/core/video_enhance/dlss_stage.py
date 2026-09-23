@@ -3,26 +3,58 @@
 Feature 1 (DLAA at 1.0x, or SR above it) and optional feature 18 share that
 single worker. The worker context is closed before this function returns, on
 every path including a ComfyUI BaseException interrupt.
+
+The header carries the neural-rendering model fields and the child environment
+carries the launch-time ones (UI correction, post-NR detail/color, the SR preset,
+the GPU index and the requested channel order). Both are built from the same
+validated plan; the environment values are written explicitly on every launch.
 """
 
 from __future__ import annotations
 
 import math
 import os
-from collections.abc import Callable, Iterable, Iterator
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from dataclasses import dataclass, replace
 
 import numpy as np
 
 from my_nodes.core.video_enhance import dnr3
-from my_nodes.core.video_enhance.channel_order import apply_channel_order, select_channel_order
+from my_nodes.core.video_enhance.channel_order import (
+    CHANNEL_ORDERS,
+    apply_channel_order,
+    select_channel_order,
+)
 from my_nodes.core.video_enhance.dlss_worker import DEFAULT_TIMEOUT_SECONDS, Dnr3Worker
 from my_nodes.core.video_enhance import motion as motion_guides
-from my_nodes.core.video_enhance.nr_profiles import NeuralRenderingSettings, neural_rendering_settings
+from my_nodes.core.video_enhance.nr_profiles import (
+    NeuralRenderingSettings,
+    plan_neural_rendering_settings,
+)
 from my_nodes.core.video_enhance.plan import VideoEnhancePlan
 from my_nodes.core.video_enhance.runtime import FEATURE_NR, FEATURE_SR, HostDriver
 
 RUNTIME_DIR_ENV = "DLSS5_RUNTIME_DIR"
+
+# Child environment the stage always writes explicitly for the DNR3 host. Every
+# name is set on every launch, also when a feature is off, so a stale value left
+# in the parent environment can never change what the worker does.
+UI_CORRECTION_ENV = "DLSS5NR_UI_CORRECTION"
+DETAIL_ENV = "DLSS5NR_DETAIL"
+COLOR_ENV = "DLSS5NR_COLOR"
+SR_PRESET_ENV = "DLSS5NR_SR_PRESET"
+GPU_INDEX_ENV = "DLSS5NR_GPU_INDEX"
+CHANNEL_ORDER_ENV = "DLSS5NR_CHANNEL_ORDER"
+# User-facing SR preset -> the DLSS model selector the runtime is pinned to.
+SR_PRESET_IDS: Mapping[str, int] = {
+    "Default": 0,
+    "E": 5,
+    "F": 6,
+    "J": 10,
+    "K": 11,
+    "L": 12,
+    "M": 13,
+}
 
 
 class FrameValidationError(ValueError):
@@ -108,7 +140,7 @@ def build_header_for(
     if plan.enable_neural_rendering:
         features |= FEATURE_NR
     if settings is None:
-        settings = neural_rendering_settings(plan.nr_profile, plan.nr_intensity)
+        settings = plan_neural_rendering_settings(plan)
     return dnr3.Header(
         input_width=width,
         input_height=height,
@@ -121,13 +153,53 @@ def build_header_for(
         preset=settings.preset,
         style=settings.style,
         automask=settings.automask,
-        ui_correction=False,
+        ui_correction=settings.ui_correction,
         intensity=settings.intensity,
         tone=settings.tone,
         structure=settings.structure,
         skin=settings.skin,
         global_tone=settings.global_tone,
     )
+
+
+def _env_number(value: float) -> str:
+    """Deterministic decimal text for one plan value, so equal plans set equal env."""
+    return repr(float(value))
+
+
+def worker_environment(plan: VideoEnhancePlan, channel_order: str) -> dict[str, str]:
+    """The child environment values one DLSS worker launch always sets itself.
+
+    `channel_order` is the order the user asked for (`auto`, `RGBA` or `BGRA`),
+    not the resolved one: the host needs the request, the stage decides the
+    readback order. Every value is written explicitly, so an inherited variable
+    of the same name is replaced instead of silently changing the run.
+    """
+    if channel_order not in CHANNEL_ORDERS:
+        raise FrameValidationError(
+            f"channel order must be one of {CHANNEL_ORDERS}, got {channel_order!r}"
+        )
+    settings = plan_neural_rendering_settings(plan)
+    return {
+        UI_CORRECTION_ENV: "1" if settings.ui_correction else "0",
+        DETAIL_ENV: _env_number(plan.nr_detail),
+        COLOR_ENV: _env_number(plan.nr_color),
+        SR_PRESET_ENV: str(SR_PRESET_IDS[plan.sr_preset]),
+        GPU_INDEX_ENV: str(plan.gpu_index),
+        CHANNEL_ORDER_ENV: channel_order,
+    }
+
+
+def apply_worker_environment(
+    driver: HostDriver, plan: VideoEnhancePlan, channel_order: str
+) -> HostDriver:
+    """Overlay the explicit worker values on a driver, replacing stale parents.
+
+    The driver stays frozen and keeps everything else it carried: a host built
+    from the real process environment or by a custom factory only has these six
+    values replaced.
+    """
+    return replace(driver, env={**driver.env, **worker_environment(plan, channel_order)})
 
 
 def resolve_runtime_dir(
@@ -183,14 +255,16 @@ class DlssStageStream:
     """One DLSS stage over an iterable of frames: one worker, one guide chain.
 
     The stream is a context manager. `__enter__` validates the runtime, frees
-    Comfy memory and starts exactly one `Dnr3Worker` for the whole stage;
-    `__exit__` always reaps that worker, including on a ComfyUI BaseException
-    interrupt and on an abandoned iteration. Iterating yields one corrected
-    float32 frame per input frame, in order, and refuses a source that is
-    shorter or longer than `count` instead of padding or truncating it.
+    Comfy memory and starts exactly one `Dnr3Worker` for the whole stage, with
+    the plan's launch environment layered over the driver's; `__exit__` always
+    reaps that worker, including on a ComfyUI BaseException interrupt and on an
+    abandoned iteration. Iterating yields one corrected float32 frame per input
+    frame, in order, and refuses a source that is shorter or longer than `count`
+    instead of padding or truncating it.
 
     `channel_order` is the resolved order: an explicit order is kept, `auto`
-    is decided by the first input/output pair and then reused for the stage.
+    is decided by the first input/output pair and then reused for the stage. The
+    requested value also reaches the worker through `DLSS5NR_CHANNEL_ORDER`.
     """
 
     def __init__(
@@ -213,9 +287,11 @@ class DlssStageStream:
         memory_hooks: tuple[Callable[[], None], Callable[[], None]] | None = None,
     ) -> None:
         self._header = build_header_for(plan, count=count, height=height, width=width)
+        self._plan = plan
         self._source = source
         self._runtime_dir = runtime_dir
         self._wine_prefix = wine_prefix
+        self._requested_channel_order = channel_order
         self._channel_order: str | None = None if channel_order == "auto" else channel_order
         self._motion_mode = motion_mode
         self._scene_cut_threshold = scene_cut_threshold
@@ -261,11 +337,24 @@ class DlssStageStream:
             empty_cache()
         factory = self._driver_factory if self._driver_factory is not None else HostDriver.wine
         prefix = self._wine_prefix.strip() or None
+        if self._driver_factory is None:
+            # The built-in driver takes the selected GPU, so its environment
+            # already names the adapter before the explicit overlay below.
+            driver = factory(
+                runtime_dir=self._runtime_dir,
+                features=self._header.features,
+                wine_prefix=prefix,
+                gpu_index=self._plan.gpu_index,
+            )
+        else:
+            # A test or custom host factory only knows the original keywords;
+            # its frozen driver is overlaid instead of being called differently.
+            driver = factory(
+                runtime_dir=self._runtime_dir, features=self._header.features, wine_prefix=prefix
+            )
         worker = Dnr3Worker(
             self._header,
-            driver=factory(
-                runtime_dir=self._runtime_dir, features=self._header.features, wine_prefix=prefix
-            ),
+            driver=apply_worker_environment(driver, self._plan, self._requested_channel_order),
             timeout=self._timeout,
             interrupt=self._interrupt,
         )

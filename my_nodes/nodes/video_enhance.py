@@ -26,9 +26,12 @@ from my_nodes.core.video_enhance.frame_pipeline import (
     run_frame_pipeline,
 )
 from my_nodes.core.video_enhance.motion import MOTION_MODES, MOTION_OPTICAL_FLOW
-from my_nodes.core.video_enhance.nr_profiles import neural_rendering_settings
+from my_nodes.core.video_enhance.nr_profiles import plan_neural_rendering_settings
 from my_nodes.core.video_enhance.plan import (
+    NR_PRESETS,
     NR_PROFILES,
+    NR_STYLES,
+    SR_PRESETS,
     STAGE_ORDER_DLSS_THEN_VFI,
     STAGE_ORDERS,
     VideoEnhancePlan,
@@ -60,6 +63,70 @@ STAGE_ORDER_TOOLTIP = (
     "default, vfi_then_dlss interpolates first and enhances the interpolated frames."
 )
 
+CUSTOM_PROFILE_ONLY = "Used when nr_profile=custom."
+
+# The advanced DLSS controls both nodes append, in this order, after
+# `stage_order`. Every model field is read only by the `custom` profile; the
+# post-NR composite controls and the SR preset apply whenever their feature runs.
+ADVANCED_OPTIONAL: dict[str, tuple] = {
+    "style": (list(NR_STYLES), {
+        "default": "Cinematic", "advanced": True,
+        "tooltip": f"DLSSNR.Style, the neural-rendering model style. {CUSTOM_PROFILE_ONLY}",
+    }),
+    "preset": (list(NR_PRESETS), {
+        "default": "Default", "advanced": True,
+        "tooltip": f"DLSSNR.Hint.Render.Preset, the neural-rendering model preset. {CUSTOM_PROFILE_ONLY}",
+    }),
+    "local_structure": ("FLOAT", {
+        "default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05, "advanced": True,
+        "tooltip": f"DLSSNR.LocalStructureStrength. {CUSTOM_PROFILE_ONLY}",
+    }),
+    "local_tone": ("FLOAT", {
+        "default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05, "advanced": True,
+        "tooltip": f"DLSSNR.LocalToneStrength. {CUSTOM_PROFILE_ONLY}",
+    }),
+    "skin": ("FLOAT", {
+        "default": -1.0, "min": -1.0, "max": 2.0, "step": 0.05, "advanced": True,
+        "tooltip": (
+            "DLSSNR.SkinStructureStrength; -1 leaves the model default in place. "
+            f"{CUSTOM_PROFILE_ONLY}"
+        ),
+    }),
+    "detail": ("FLOAT", {
+        "default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05, "advanced": True,
+        "tooltip": (
+            "Post-NR composite detail. Applies whenever neural rendering is enabled, "
+            "not only with nr_profile=custom; 1.0 keeps the raw model output."
+        ),
+    }),
+    "color": ("FLOAT", {
+        "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "advanced": True,
+        "tooltip": (
+            "Post-NR composite color. Applies whenever neural rendering is enabled, "
+            "not only with nr_profile=custom; 1.0 keeps the raw model output."
+        ),
+    }),
+    "ui_correction": ("BOOLEAN", {
+        "default": False, "advanced": True,
+        "tooltip": f"DLSSNR.UICorrection, the UI/high-frequency correction pass. {CUSTOM_PROFILE_ONLY}",
+    }),
+    "auto_mask": ("BOOLEAN", {
+        "default": False, "advanced": True,
+        "tooltip": f"DLSSNR.UseAutoMask. {CUSTOM_PROFILE_ONLY}",
+    }),
+    "sr_preset": (list(SR_PRESETS), {
+        "default": "Default", "advanced": True,
+        "tooltip": (
+            "DLSS super-resolution model preset; Default keeps the runtime default. "
+            "Applies whenever super resolution runs."
+        ),
+    }),
+    "gpu_index": ("INT", {
+        "default": 0, "min": 0, "max": 15, "step": 1, "advanced": True,
+        "tooltip": "Adapter index the DLSS worker uses; 0 is the first visible GPU.",
+    }),
+}
+
 DESCRIPTION = (
     "DLSS feature 1 (DLAA at 1.0, or super resolution above it), then optional "
     "feature 18 neural rendering in the same worker, then optional offline "
@@ -67,8 +134,9 @@ DESCRIPTION = (
     "enhance the interpolated frames instead. Disabled stages are not touched. "
     "A two-stage run stages the intermediate frames on disk, not in RAM. "
     "1.0 is native DLAA, not an upscale. Neural-rendering profiles are local "
-    "UX presets, not NVIDIA official presets. Frame interpolation is offline "
-    "GIMM-VFI, not DLSS Frame Generation."
+    "UX presets, not NVIDIA official presets; the advanced model fields are read "
+    "by nr_profile=custom, while detail and color are post-NR composite controls. "
+    "Frame interpolation is offline GIMM-VFI, not DLSS Frame Generation."
 )
 
 
@@ -93,13 +161,41 @@ def _plan(
     nr_intensity: float,
     enable_vfi: bool,
     stage_order: str = STAGE_ORDER_DLSS_THEN_VFI,
+    *,
+    style: str = "Cinematic",
+    preset: str = "Default",
+    local_structure: float = 1.0,
+    local_tone: float = 1.0,
+    skin: float = -1.0,
+    detail: float = 1.0,
+    color: float = 1.0,
+    ui_correction: bool = False,
+    auto_mask: bool = False,
+    sr_preset: str = "Default",
+    gpu_index: int = 0,
 ) -> VideoEnhancePlan:
+    """Build the plan from the node settings; unknown values fail here, before a backend.
+
+    The widget names differ from the plan field names only where a plan field is
+    neural-rendering specific (`nr_style`, `nr_local_tone`, `nr_ui_correction`).
+    """
     return VideoEnhancePlan(
         enable_super_resolution=bool(enable_sr),
         sr_scale=spatial_scale(spatial_mode),
         enable_neural_rendering=bool(enable_nr),
         nr_profile=str(nr_profile),
         nr_intensity=float(nr_intensity),
+        nr_style=str(style),
+        nr_preset=str(preset),
+        nr_local_structure=local_structure,
+        nr_local_tone=local_tone,
+        nr_skin=skin,
+        nr_detail=detail,
+        nr_color=color,
+        nr_ui_correction=ui_correction,
+        nr_auto_mask=auto_mask,
+        sr_preset=str(sr_preset),
+        gpu_index=gpu_index,
         enable_frame_interpolation=bool(enable_vfi),
         interpolation_factor=2,
         stage_order=stage_order,
@@ -155,7 +251,7 @@ def _status(plan: VideoEnhancePlan, frame_count: int, channel_order: str | None)
         label = "DLAA 1.0x" if plan.sr_scale == 1.0 else f"SR {plan.sr_scale:.1f}x"
         parts.append(label)
     if plan.enable_neural_rendering:
-        settings = neural_rendering_settings(plan.nr_profile, plan.nr_intensity)
+        settings = plan_neural_rendering_settings(plan)
         parts.append(
             f"NR {settings.profile} intensity={settings.intensity:.2f} "
             f"style={settings.style} preset={settings.preset}"
@@ -167,6 +263,22 @@ def _status(plan: VideoEnhancePlan, frame_count: int, channel_order: str | None)
     if multiplier == 2:
         parts.append("encode at input FPS x2")
     return multiplier, "; ".join(parts)
+
+
+def _advanced_inputs() -> list:
+    """The v3 `io` inputs of `ADVANCED_OPTIONAL`, derived from the classic widgets.
+
+    Both schemas therefore expose the same names, choices, defaults, ranges and
+    tooltips in the same order; only the widget representation differs.
+    """
+    kinds = {"FLOAT": io.Float.Input, "INT": io.Int.Input, "BOOLEAN": io.Boolean.Input}
+    inputs: list = []
+    for name, (kind, options) in ADVANCED_OPTIONAL.items():
+        if isinstance(kind, list):
+            inputs.append(io.Combo.Input(name, options=list(kind), **options))
+        else:
+            inputs.append(kinds[kind](name, **options))
+    return inputs
 
 
 class MyVideoEnhance:
@@ -192,7 +304,10 @@ class MyVideoEnhance:
                 }),
                 "nr_profile": (list(NR_PROFILES), {
                     "default": "standard",
-                    "tooltip": "Local UX profile, not an NVIDIA official preset.",
+                    "tooltip": (
+                        "Local UX profile, not an NVIDIA official preset. custom "
+                        "reads the advanced model fields instead."
+                    ),
                 }),
                 "nr_intensity": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
                 "enable_frame_interpolation": ("BOOLEAN", {
@@ -226,6 +341,10 @@ class MyVideoEnhance:
                     "default": STAGE_ORDER_DLSS_THEN_VFI, "advanced": True,
                     "tooltip": STAGE_ORDER_TOOLTIP,
                 }),
+                # Keep every pre-existing widget at its serialized array index.
+                # ComfyUI restores workflows positionally unless its experimental
+                # named-value restore setting is enabled.
+                **ADVANCED_OPTIONAL,
             },
         }
 
@@ -253,6 +372,17 @@ class MyVideoEnhance:
         wine_prefix="",
         worker_timeout=600.0,
         stage_order=STAGE_ORDER_DLSS_THEN_VFI,
+        style="Cinematic",
+        preset="Default",
+        local_structure=1.0,
+        local_tone=1.0,
+        skin=-1.0,
+        detail=1.0,
+        color=1.0,
+        ui_correction=False,
+        auto_mask=False,
+        sr_preset="Default",
+        gpu_index=0,
     ):
         plan = _plan(
             enable_super_resolution,
@@ -262,6 +392,17 @@ class MyVideoEnhance:
             nr_intensity,
             enable_frame_interpolation,
             stage_order,
+            style=style,
+            preset=preset,
+            local_structure=local_structure,
+            local_tone=local_tone,
+            skin=skin,
+            detail=detail,
+            color=color,
+            ui_correction=ui_correction,
+            auto_mask=auto_mask,
+            sr_preset=sr_preset,
+            gpu_index=gpu_index,
         )
         _check_choice(str(vfi_precision), VFI_PRECISIONS, "vfi_precision")
         _check_choice(str(motion), MOTION_MODES, "motion")
@@ -271,16 +412,18 @@ class MyVideoEnhance:
             _multiplier, status = _status(plan, count, None)
             return (images, 1, status)
 
-        import folder_paths
-
         frames = prepare_frames(images)
         source_spec = FrameSpec(
             count=int(frames.shape[0]), height=int(frames.shape[1]), width=int(frames.shape[2])
         )
         specs = pipeline_specs(source_spec, plan)
+        # Every check that can reject the run happens before ComfyUI's paths and
+        # the output allocation are touched, so a refusal leaves nothing behind.
         require_output_ram(specs.final.nbytes)
         # Only the final IMAGE is held in RAM; an intermediate goes to disk.
         output = np.empty(specs.final.shape, dtype=np.float32)
+
+        import folder_paths
 
         def write_frame(index: int, frame) -> None:
             output[index] = frame
@@ -334,7 +477,7 @@ class MyVideoEnhance:
                     io.Boolean.Input("enable_super_resolution", default=False, tooltip="DLSS feature 1. 1.0 is native DLAA."),
                     io.Combo.Input("spatial_mode", options=list(SPATIAL_LABELS), default="2.0x"),
                     io.Boolean.Input("enable_neural_rendering", default=False, tooltip="Experimental DLSS feature 18."),
-                    io.Combo.Input("nr_profile", options=list(NR_PROFILES), default="standard", tooltip="Local UX profile, not an NVIDIA preset."),
+                    io.Combo.Input("nr_profile", options=list(NR_PROFILES), default="standard", tooltip="Local UX profile, not an NVIDIA preset. custom reads the advanced model fields instead."),
                     io.Float.Input("nr_intensity", default=1.0, min=0.0, max=2.0, step=0.05),
                     io.Boolean.Input("enable_frame_interpolation", default=False, tooltip="Offline GIMM-VFI 2x, not DLSS Frame Generation."),
                     io.Combo.Input("vfi_precision", options=list(VFI_PRECISIONS), default="fp32", advanced=True),
@@ -346,6 +489,7 @@ class MyVideoEnhance:
                     io.String.Input("wine_prefix", default="", advanced=True),
                     io.Float.Input("worker_timeout", default=600.0, min=1.0, max=86400.0, step=1.0, advanced=True),
                     io.Combo.Input("stage_order", options=list(STAGE_ORDERS), default=STAGE_ORDER_DLSS_THEN_VFI, advanced=True, tooltip=STAGE_ORDER_TOOLTIP),
+                    *_advanced_inputs(),
                 ],
                 outputs=[
                     io.Image.Output(display_name="images"),

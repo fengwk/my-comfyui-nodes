@@ -8,7 +8,8 @@ production host writes.
 
 The first argument selects the failure behaviour; every run also appends what
 it saw to a JSON report file (`FAKE_DNR3_REPORT`) so tests can assert the exact
-bytes the parent put on the wire - including the session feature flags.
+bytes the parent put on the wire - including the session feature flags - and the
+launch environment the parent wrote explicitly.
 
 Modes
 -----
@@ -61,6 +62,17 @@ MODES: tuple[str, ...] = (
 )
 REPORT_ENV = "FAKE_DNR3_REPORT"
 ERROR_MESSAGE = "fake DNR3 worker: neural-rendering runtime unavailable"
+# Launch-time controls the stage writes explicitly; recorded so a test can prove
+# what the real child process received, including that a stale parent value was
+# replaced.
+WATCHED_ENV: tuple[str, ...] = (
+    "DLSS5NR_UI_CORRECTION",
+    "DLSS5NR_DETAIL",
+    "DLSS5NR_COLOR",
+    "DLSS5NR_SR_PRESET",
+    "DLSS5NR_GPU_INDEX",
+    "DLSS5NR_CHANNEL_ORDER",
+)
 
 
 class Report:
@@ -186,6 +198,7 @@ def main(argv: list[str]) -> int:
     report.set("pid", os.getpid())
     report.set("pgrp", os.getpgrp())
     report.set("sid", os.getsid(0))
+    report.set("env", {name: os.environ.get(name) for name in WATCHED_ENV})
     if mode == "stubborn" or mode == "stubborn-child":
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
     if mode == "stubborn-child":

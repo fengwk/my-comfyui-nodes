@@ -218,6 +218,105 @@
             "name": "stage_order"
           },
           "link": null
+        },
+        {
+          "name": "style",
+          "shape": 7,
+          "type": "COMBO",
+          "widget": {
+            "name": "style"
+          },
+          "link": null
+        },
+        {
+          "name": "preset",
+          "shape": 7,
+          "type": "COMBO",
+          "widget": {
+            "name": "preset"
+          },
+          "link": null
+        },
+        {
+          "name": "local_structure",
+          "shape": 7,
+          "type": "FLOAT",
+          "widget": {
+            "name": "local_structure"
+          },
+          "link": null
+        },
+        {
+          "name": "local_tone",
+          "shape": 7,
+          "type": "FLOAT",
+          "widget": {
+            "name": "local_tone"
+          },
+          "link": null
+        },
+        {
+          "name": "skin",
+          "shape": 7,
+          "type": "FLOAT",
+          "widget": {
+            "name": "skin"
+          },
+          "link": null
+        },
+        {
+          "name": "detail",
+          "shape": 7,
+          "type": "FLOAT",
+          "widget": {
+            "name": "detail"
+          },
+          "link": null
+        },
+        {
+          "name": "color",
+          "shape": 7,
+          "type": "FLOAT",
+          "widget": {
+            "name": "color"
+          },
+          "link": null
+        },
+        {
+          "name": "ui_correction",
+          "shape": 7,
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "ui_correction"
+          },
+          "link": null
+        },
+        {
+          "name": "auto_mask",
+          "shape": 7,
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "auto_mask"
+          },
+          "link": null
+        },
+        {
+          "name": "sr_preset",
+          "shape": 7,
+          "type": "COMBO",
+          "widget": {
+            "name": "sr_preset"
+          },
+          "link": null
+        },
+        {
+          "name": "gpu_index",
+          "shape": 7,
+          "type": "INT",
+          "widget": {
+            "name": "gpu_index"
+          },
+          "link": null
         }
       ],
       "outputs": [
@@ -259,7 +358,18 @@
         "",
         "",
         600.0,
-        "vfi_then_dlss"
+        "vfi_then_dlss",
+        "Cinematic",
+        "Default",
+        1.0,
+        1.0,
+        -1.0,
+        1.0,
+        1.0,
+        false,
+        false,
+        "Default",
+        0
       ]
     },
     {

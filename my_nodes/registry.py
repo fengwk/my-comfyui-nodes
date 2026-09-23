@@ -43,6 +43,13 @@ except ImportError as exc:
 if SelfLiftH3Sampler is not None:
     NODE_CLASSES = NODE_CLASSES + (SelfLiftH3Sampler,)
 
+try:
+    from my_nodes.nodes.te_speed_vosr2 import VOSR2_NODE_CLASSES
+except ImportError as exc:
+    logging.warning("TE-Speed VOSR2 nodes not registered (missing dependency): %s", exc)
+    VOSR2_NODE_CLASSES = ()
+
+NODE_CLASSES = NODE_CLASSES + VOSR2_NODE_CLASSES
 NODE_CLASSES = NODE_CLASSES + (MyVideoEnhance, MyDLSSRuntimeProbe, MyVideoEnhanceStream)
 
 

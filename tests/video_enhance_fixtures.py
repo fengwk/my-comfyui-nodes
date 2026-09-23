@@ -16,6 +16,38 @@ FAKE_WORKER = Path(__file__).with_name("video_enhance_fake_dnr3_worker.py")
 
 _GONE_TIMEOUT_SECONDS = 3.0
 
+# The advanced DLSS controls both nodes expose: widget name -> (plan field, the
+# widget's [min, max] contract or None for the choice/boolean widgets). Shared so
+# the two node test modules assert one contract instead of restating it.
+ADVANCED_CONTROLS: dict[str, tuple[str, tuple[float, float] | None]] = {
+    "style": ("nr_style", None),
+    "preset": ("nr_preset", None),
+    "local_structure": ("nr_local_structure", (0.0, 2.0)),
+    "local_tone": ("nr_local_tone", (0.0, 2.0)),
+    "skin": ("nr_skin", (-1.0, 2.0)),
+    "detail": ("nr_detail", (0.0, 2.0)),
+    "color": ("nr_color", (0.0, 1.0)),
+    "ui_correction": ("nr_ui_correction", None),
+    "auto_mask": ("nr_auto_mask", None),
+    "sr_preset": ("sr_preset", None),
+    "gpu_index": ("gpu_index", (0, 15)),
+}
+ADVANCED_NAMES: list[str] = list(ADVANCED_CONTROLS)
+# Values a workflow would set to prove every control is wired into the plan.
+ADVANCED_VALUES: dict[str, object] = {
+    "style": "Natural",
+    "preset": "Preset 2",
+    "local_structure": 0.5,
+    "local_tone": 1.25,
+    "skin": 0.75,
+    "detail": 0.25,
+    "color": 0.5,
+    "ui_correction": True,
+    "auto_mask": True,
+    "sr_preset": "M",
+    "gpu_index": 2,
+}
+
 
 def create_runtime_dir(
     root: Path,
