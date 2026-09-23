@@ -232,14 +232,30 @@ class TESpeedVOSR2Video(_VOSR2Base):
     ):
         from my_nodes.core.vosr2.inference import run_vosr2
 
-        effective = (settings or VOSR2Settings()).normalized()
+        defaults = VOSR2Settings()
+        effective = (settings or defaults).normalized()
         effective_batch = int(frame_batch) or effective.frame_batch
+        # An unchanged Video widget inherits the linked Settings value; with
+        # boolean widgets, disabling a linked cache requires changing Settings.
+        inherit = settings is not None
         effective = replace(
             effective,
             frame_batch=effective_batch,
-            temporal_cache=bool(temporal_cache),
-            cache_threshold=float(cache_threshold),
-            cache_refresh=int(cache_refresh),
+            temporal_cache=(
+                effective.temporal_cache
+                if inherit and temporal_cache == defaults.temporal_cache
+                else bool(temporal_cache)
+            ),
+            cache_threshold=(
+                effective.cache_threshold
+                if inherit and cache_threshold == defaults.cache_threshold
+                else float(cache_threshold)
+            ),
+            cache_refresh=(
+                effective.cache_refresh
+                if inherit and cache_refresh == defaults.cache_refresh
+                else int(cache_refresh)
+            ),
         ).normalized()
         return run_vosr2(
             model,

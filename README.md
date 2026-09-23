@@ -55,19 +55,6 @@ LoadVideo
 
 输出仍是 `IMAGE`。色块网格固定 `36×64`（576×1024 时为 16×16 像素块），与原脚本一致。
 
-### My SelfLift Progressive Sampler (MiniMax H3)
-
-基于 `facok/comfyui-SelfLift` 的 MiniMax H3 渐进分辨率采样节点，复制自
-`3534184`。节点 ID 为 `MySelfLiftH3Sampler`，不会覆盖原插件的
-`SelfLiftH3Sampler`；已有工作流需要手动替换为本节点。
-
-本地改动：3D latent upscaler 完成分辨率跃迁后，立即通过 ComfyUI 模型管理器
-从活跃 GPU 模型集合卸载。正常 Dynamic VRAM 模式下，
-`minimax_h3_latent_upscaler_3d_fp32.pth` 的约 1.29 GiB 权重会回到 CPU，
-再进入 MiniMax H3 高分辨率去噪；发生放大异常时也执行清理。放大结果和采样数学
-不变，后续任务再次使用该放大器时会重新载入权重。`--highvram` / `--gpu-only`
-模式的 offload device 仍可能是 GPU，此时不会获得同等显存回收。
-
 ### Patch Sol-Attn (MiniMax)
 
 第三方节点，代码在 `my_nodes/vendor/`。在 MiniMax-H3 上安装 block-sparse
@@ -125,6 +112,9 @@ RTX 3090 建议先用默认 `speed`、`tile_size=512`、`vae_tile_size=1024`；
 显存不足时将 memory policy 设为 `staged`，并降低 image/frame/DINO
 batch。视频节点可选的 `temporal_cache` 只复用变化低于阈值的相邻帧
 DINO 特征，并由 `cache_refresh` 强制周期刷新。
+连接 Settings 时，Video 节点保持默认值的缓存控件会继承 Settings 中的值；
+非默认值仍可覆盖。BOOLEAN 默认值无法区分“未改动”和“显式关闭”，如需关闭
+Settings 中已启用的缓存，请在 Settings 节点设置 `temporal_cache=false`。
 
 移植代码及上游许可证说明见
 [`my_nodes/core/vosr2/THIRD_PARTY_NOTICES.md`](my_nodes/core/vosr2/THIRD_PARTY_NOTICES.md)。
@@ -303,8 +293,8 @@ LoadVideo
 
 ## 加新节点
 
-1. 无 Comfy 依赖的算法放 `my_nodes/core/<name>.py`。
-2. 节点类放 `my_nodes/nodes/<name>.py`，同时提供经典 `INPUT_TYPES`（兼容旧加载器）。
+1. 算法与运行时适配放 `my_nodes/core/`；尽量将无框架依赖的部分单独拆出，涉及模型管理时可使用 ComfyUI API。
+2. 节点类放 `my_nodes/nodes/`，对当前 V1 注册入口提供经典 `INPUT_TYPES`。可按功能将相关节点放在同一模块。
 3. 在 `my_nodes/registry.py` 的 `NODE_CLASSES` 里登记。
 4. 在 `tests/` 补单元测试。
 
@@ -313,8 +303,8 @@ my-comfyui-nodes/
 ├── __init__.py                 # Comfy 入口
 ├── my_nodes/
 │   ├── registry.py             # 唯一登记处
-│   ├── core/                   # 纯函数，可单测
-│   ├── nodes/                  # 一个文件一个节点
+│   ├── core/                   # 算法、模型管理与运行时适配
+│   ├── nodes/                  # ComfyUI 接口；可按功能组织多个节点
 │   └── vendor/                 # 第三方节点，字节级保留原文件
 └── tests/
 ```

@@ -1,7 +1,7 @@
 """Collect node classes from feature modules.
 
 Add a new node by:
-1. putting a `io.ComfyNode` subclass in `my_nodes/nodes/`
+1. putting a node class with the V1 ComfyUI contract in `my_nodes/nodes/`
 2. appending it to `NODE_CLASSES` below
 """
 
@@ -33,15 +33,6 @@ except ImportError as exc:
 
 if SolAttnMiniMax is not None:
     NODE_CLASSES = NODE_CLASSES + (SolAttnMiniMax,)
-
-try:
-    from my_nodes.nodes.selflift import SelfLiftH3Sampler
-except ImportError as exc:
-    logging.warning("SelfLiftH3Sampler not registered (ComfyUI unavailable): %s", exc)
-    SelfLiftH3Sampler = None
-
-if SelfLiftH3Sampler is not None:
-    NODE_CLASSES = NODE_CLASSES + (SelfLiftH3Sampler,)
 
 try:
     from my_nodes.nodes.te_speed_vosr2 import VOSR2_NODE_CLASSES

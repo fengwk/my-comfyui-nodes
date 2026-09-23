@@ -236,6 +236,41 @@ class VOSR2NodeContractTests(unittest.TestCase):
             },
         )
 
+    def test_video_default_cache_widgets_inherit_linked_settings(self):
+        # Widget defaults should not silently disable a connected Settings cache.
+        linked = VOSR2Settings(
+            frame_batch=3,
+            temporal_cache=True,
+            cache_threshold=0.02,
+            cache_refresh=8,
+        )
+        fake_inference = ModuleType("my_nodes.core.vosr2.inference")
+        fake_inference.run_vosr2 = mock.Mock(return_value=("output",))
+        with mock.patch.dict(sys.modules, {"my_nodes.core.vosr2.inference": fake_inference}):
+            self.assertEqual(
+                TESpeedVOSR2Video().upscale("model", "images", 2, 7, linked),
+                ("output",),
+            )
+        args, kwargs = fake_inference.run_vosr2.call_args
+        self.assertEqual(args[4].frame_batch, 3)
+        self.assertTrue(args[4].temporal_cache)
+        self.assertEqual(args[4].cache_threshold, 0.02)
+        self.assertEqual(args[4].cache_refresh, 8)
+        self.assertTrue(kwargs["temporal_cache"])
+        self.assertTrue(linked.temporal_cache)
+
+    def test_video_cache_defaults_without_settings_remain_disabled(self):
+        # The unlinked Video node retains its old default execution behavior.
+        fake_inference = ModuleType("my_nodes.core.vosr2.inference")
+        fake_inference.run_vosr2 = mock.Mock(return_value=("output",))
+        with mock.patch.dict(sys.modules, {"my_nodes.core.vosr2.inference": fake_inference}):
+            TESpeedVOSR2Video().upscale("model", "images", 2, 7)
+        args, kwargs = fake_inference.run_vosr2.call_args
+        self.assertFalse(args[4].temporal_cache)
+        self.assertEqual(args[4].cache_threshold, 0.003)
+        self.assertEqual(args[4].cache_refresh, 4)
+        self.assertFalse(kwargs["temporal_cache"])
+
 
 if __name__ == "__main__":
     unittest.main()

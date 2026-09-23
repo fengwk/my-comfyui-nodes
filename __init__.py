@@ -15,18 +15,5 @@ if str(_PACK_ROOT) not in sys.path:
     sys.path.insert(0, str(_PACK_ROOT))
 
 from my_nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
-from my_nodes.registry import NODE_CLASSES
 
-__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "comfy_entrypoint"]
-
-
-async def comfy_entrypoint():
-    from comfy_api.latest import ComfyExtension, io
-    from typing_extensions import override
-
-    class MyNodesExtension(ComfyExtension):
-        @override
-        async def get_node_list(self) -> list[type[io.ComfyNode]]:
-            return list(NODE_CLASSES)
-
-    return MyNodesExtension()
+__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
