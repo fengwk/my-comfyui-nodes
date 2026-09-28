@@ -232,6 +232,10 @@ LoadVideo
 
 增强开关与高级项和上一节相同（`enable_super_resolution` / `spatial_mode` / `enable_neural_rendering` / `nr_profile` / `nr_intensity` / `style` / `preset` / `local_structure` / `local_tone` / `skin` / `detail` / `color` / `ui_correction` / `auto_mask` / `sr_preset` / `gpu_index` / `enable_frame_interpolation` / `vfi_precision` / `vfi_ds_factor` / `motion` / `scene_cut_threshold` / `channel_order` / `runtime_dir` / `wine_prefix` / `worker_timeout`，含义、默认值与生效范围见上一节：模型字段只在 `nr_profile=custom` 下生效，`detail` / `color` 在启用神经渲染时始终生效）。流式节点新增或默认值不同的输入：
 
+两个增强节点的面板会按 DLSS / NR / GIMM / 输出 / 运行环境标记参数，并在前端隐藏当前关闭的功能、非 `custom` 配置等不会生效的选项；切换功能后会重新显示。控制参数来自上游连线时，其值要到执行时才能确定，因此保守显示可能生效的选项。**隐藏不会清除已有值，也不会改变旧工作流的字段顺序**。首次安装前端扩展后需重启 ComfyUI 并刷新页面；没有加载扩展时仍可使用节点，只是显示完整的原始参数列表。
+
+`Stream` 和 `IMAGE` 节点使用同一套增强阶段，流式接口不改变单帧推理算法。但从 VIDEO 输入到 VIDEO 输出，流式节点还要预扫全片帧时间戳、解码、编码并重封装音频；启用 DLSS 与 GIMM 两阶段时，两个节点都会读写磁盘中间帧，并非 Stream 独有的开销。与已在内存中的 IMAGE 批次相比，Stream 会增加视频 I/O；与其他需要先加载整段视频、最后再编码的完整工作流相比，耗时取决于编解码器、磁盘、分辨率与阶段顺序。优势是峰值帧缓冲 RAM 不随视频长度线性增长，不保证更快。
+
 | 输入 | 默认 | 含义 |
 |---|---|---|
 | `video` | — | 本地的、可 seek 的、文件型 VIDEO |

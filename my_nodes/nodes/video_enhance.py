@@ -300,7 +300,7 @@ class MyVideoEnhance:
                 "spatial_mode": (list(SPATIAL_LABELS), {"default": "2.0x"}),
                 "enable_neural_rendering": ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "DLSS feature 18 after feature 1, in the same worker. Experimental.",
+                    "tooltip": "Experimental DLSS feature 18; shares the Wine worker with feature 1 when SR is enabled.",
                 }),
                 "nr_profile": (list(NR_PROFILES), {
                     "default": "standard",
@@ -312,7 +312,7 @@ class MyVideoEnhance:
                 "nr_intensity": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
                 "enable_frame_interpolation": ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "Offline GIMM-VFI 2x after the DLSS worker exits. Not DLSS Frame Generation.",
+                    "tooltip": "Offline GIMM-VFI 2x, not DLSS Frame Generation. stage_order controls its order relative to DLSS.",
                 }),
             },
             "optional": {

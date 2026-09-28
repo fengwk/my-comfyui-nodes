@@ -19,6 +19,9 @@ class RegistryEntrypointTests(unittest.TestCase):
         self.assertNotIn("comfy_entrypoint", vars(module))
         self.assertIn("TESpeedVOSR2Video", module.NODE_CLASS_MAPPINGS)
         self.assertNotIn("MySelfLiftH3Sampler", module.NODE_CLASS_MAPPINGS)
+        # ComfyUI serves the presentation-only extension without changing V1 inputs.
+        self.assertEqual(module.WEB_DIRECTORY, "./web")
+        self.assertTrue((root.parent / module.WEB_DIRECTORY / "video_enhance.js").is_file())
 
 
 if __name__ == "__main__":
