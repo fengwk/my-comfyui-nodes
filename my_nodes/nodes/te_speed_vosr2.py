@@ -13,7 +13,7 @@ SETTINGS_TYPE = "TE_SPEED_VOSR2_SETTINGS"
 
 class TESpeedVOSR2Loader:
     NODE_ID = "TESpeedVOSR2Loader"
-    DISPLAY_NAME = "TE-Speed VOSR2 Loader"
+    DISPLAY_NAME = "My TE-Speed VOSR2 Loader"
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -69,7 +69,7 @@ class TESpeedVOSR2Loader:
 
 class TESpeedVOSR2Settings:
     NODE_ID = "TESpeedVOSR2Settings"
-    DISPLAY_NAME = "TE-Speed VOSR2 Settings"
+    DISPLAY_NAME = "My TE-Speed VOSR2 Settings"
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -184,12 +184,12 @@ class _VOSR2Base:
 
 class TESpeedVOSR2Image(_VOSR2Base):
     NODE_ID = "TESpeedVOSR2Image"
-    DISPLAY_NAME = "TE-Speed VOSR2 Image"
+    DISPLAY_NAME = "My TE-Speed VOSR2 Image"
 
 
 class TESpeedVOSR2Video(_VOSR2Base):
     NODE_ID = "TESpeedVOSR2Video"
-    DISPLAY_NAME = "TE-Speed VOSR2 Video Frames"
+    DISPLAY_NAME = "My TE-Speed VOSR2 Video Frames"
 
     @classmethod
     def INPUT_TYPES(cls):

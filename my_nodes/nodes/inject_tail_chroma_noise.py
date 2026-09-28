@@ -47,7 +47,7 @@ class InjectTailChromaNoise:
     """
 
     NODE_ID = "MiniMaxH3InjectTailNoise"
-    DISPLAY_NAME = "MiniMax H3 Inject Tail Noise"
+    DISPLAY_NAME = "My MiniMax H3 Inject Tail Noise"
 
     @classmethod
     def INPUT_TYPES(cls):

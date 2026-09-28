@@ -40,6 +40,25 @@ LoadVideo
 
 ## 节点
 
+### My Image Resize Long Edge (长边缩放)
+
+将图片或视频 IMAGE 帧批次的长边缩放到 `long_edge`（默认 **640**），短边等比例取整，
+至少 1 像素；不裁剪、不补边，不强制对齐到 8/16 的倍数。
+`only_downscale`（仅缩小）默认开启：输入长边不超过目标时原样返回，不插值、不复制；
+例如 `320×180` 在目标 640 时保持不变。关闭后允许将小图放大到目标长边。
+旧工作流未提供该参数时也默认仅缩小；需要原先的放大行为时请显式关闭。
+默认 `bicubic`（双三次），可选 `bilinear`、`nearest`、`area`；
+双三次／双线性开启抗锯齿，发生缩放时输出限制到 `[0,1]`。保留帧数、顺序、张量设备及 dtype。
+
+```text
+VHS Load Video.images → My Image Resize Long Edge → My TE-Speed VOSR2 Video Frames
+```
+
+例如 `1664×928 → 640×357`，再接 VOSR2 的 `scale=2` 输出 `1280×714`。
+音频直接从加载节点接到 Video Combine，保持原 FPS。
+逐帧插值并预分配输出，避免一次处理全批产生巨量中间张量；
+但输入／输出仍是整批 IMAGE，**不是流式视频节点**，也不会减少上游加载原视频的内存。
+
 ### MiniMax H3 Inject Tail Noise
 
 把 T3 紫绿色块灌进 IMAGE 批次的尾帧。配方默认：`tail=22`，前 19 帧 `alpha=0.45`，末 3 帧渐到 `0.10`。
@@ -232,7 +251,9 @@ LoadVideo
 
 增强开关与高级项和上一节相同（`enable_super_resolution` / `spatial_mode` / `enable_neural_rendering` / `nr_profile` / `nr_intensity` / `style` / `preset` / `local_structure` / `local_tone` / `skin` / `detail` / `color` / `ui_correction` / `auto_mask` / `sr_preset` / `gpu_index` / `enable_frame_interpolation` / `vfi_precision` / `vfi_ds_factor` / `motion` / `scene_cut_threshold` / `channel_order` / `runtime_dir` / `wine_prefix` / `worker_timeout`，含义、默认值与生效范围见上一节：模型字段只在 `nr_profile=custom` 下生效，`detail` / `color` 在启用神经渲染时始终生效）。流式节点新增或默认值不同的输入：
 
-两个增强节点的面板会按 DLSS / NR / GIMM / 输出 / 运行环境标记参数，并在前端隐藏当前关闭的功能、非 `custom` 配置等不会生效的选项；切换功能后会重新显示。控制参数来自上游连线时，其值要到执行时才能确定，因此保守显示可能生效的选项。**隐藏不会清除已有值，也不会改变旧工作流的字段顺序**。首次安装前端扩展后需重启 ComfyUI 并刷新页面；没有加载扩展时仍可使用节点，只是显示完整的原始参数列表。
+两个增强节点的画布面板按 **DLSS 增强 → GIMM 插帧 → 处理顺序 → 输出编码** 分组。分组标题仅作文字与分隔线展示，没有箭头、按钮或折叠交互；各块在功能生效时自动完整显示。DLSS 内包含超分、NR、「DLSS 共用设置」「DLSS 运行环境」；选择 NR `custom` 后自动显示「NR 自定义模型」。字段按功能自动显隐，不受全局高级项开关控制。界面中的「结果混合强度」「NR 颜色比例」分别对应 `detail`、`color`，未改变计算含义。
+
+功能关闭时隐藏其专属选项；只有 DLSS 和 GIMM 同时启用才显示处理顺序；全部关闭时显示原样输出提示，隐藏无效的编码设置。控制参数来自上游连线时，其值要到执行时才能确定，因此保守显示可能生效的选项。隐藏不会清除参数值，原始输入控件数组不重排，分组标题不写入工作流参数或执行请求。首次加载前端扩展需重启 ComfyUI，更新已有扩展后刷新页面即可；没有加载扩展时仍可使用节点，只是显示原始参数布局。
 
 `Stream` 和 `IMAGE` 节点使用同一套增强阶段，流式接口不改变单帧推理算法。但从 VIDEO 输入到 VIDEO 输出，流式节点还要预扫全片帧时间戳、解码、编码并重封装音频；启用 DLSS 与 GIMM 两阶段时，两个节点都会读写磁盘中间帧，并非 Stream 独有的开销。与已在内存中的 IMAGE 批次相比，Stream 会增加视频 I/O；与其他需要先加载整段视频、最后再编码的完整工作流相比，耗时取决于编解码器、磁盘、分辨率与阶段顺序。优势是峰值帧缓冲 RAM 不随视频长度线性增长，不保证更快。
 

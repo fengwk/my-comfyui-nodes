@@ -715,7 +715,7 @@ class SolAttnMiniMax(io.ComfyNode):
     def define_schema(cls):
         return io.Schema(
             node_id="SolAttnMiniMax",
-            display_name="Patch Sol-Attn (MiniMax)",
+            display_name="My Patch Sol-Attn (MiniMax)",
             is_experimental=True,
             category="sol_attn",
             description="Training-free block-sparse attention (Sol-Attn, arXiv "

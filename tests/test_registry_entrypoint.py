@@ -8,6 +8,18 @@ import unittest
 
 
 class RegistryEntrypointTests(unittest.TestCase):
+    def test_all_registered_display_names_have_one_my_prefix(self):
+        # Check both the public mappings and V3 schemas so UI paths agree.
+        from my_nodes.registry import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
+
+        for node_id, cls in NODE_CLASS_MAPPINGS.items():
+            with self.subTest(node_id=node_id):
+                name = NODE_DISPLAY_NAME_MAPPINGS[node_id]
+                self.assertTrue(name.startswith("My "), name)
+                self.assertFalse(name.startswith("My My "), name)
+                if hasattr(cls, "define_schema"):
+                    self.assertEqual(cls.define_schema().display_name, name)
+
     def test_root_exposes_v1_mappings_without_partial_v3_extension(self):
         # ComfyUI selects V1 first; the old V3 list contained V1-only nodes.
         root = Path(__file__).resolve().parents[1] / "__init__.py"

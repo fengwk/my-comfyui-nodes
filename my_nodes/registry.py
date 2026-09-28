@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 
 from my_nodes.nodes.inject_tail_chroma_noise import InjectTailChromaNoise
+from my_nodes.nodes.image_resize import MyImageResizeLongEdge
 
 # Video enhance stays importable without torch/Comfy/GIMM. Registration itself
 # must not start a backend; the nodes import those only when a stage is enabled,
@@ -19,9 +20,10 @@ from my_nodes.nodes.video_enhance_stream import MyVideoEnhanceStream
 
 NODE_CLASSES = (
     InjectTailChromaNoise,
+    MyImageResizeLongEdge,
 )
 
-# Third-party Sol-Attn node (Kijai / t8star), vendored verbatim from
+# Third-party Sol-Attn node (Kijai / t8star), with a local display-name prefix, from
 # https://huggingface.co/t8star/Sol-Attn-v2-wheels. It imports comfy_kitchen
 # and comfy_api at module scope, so import it lazily here: unit tests run
 # outside ComfyUI, where comfy_api does not exist.
