@@ -510,7 +510,8 @@ class MyDLSSRuntimeProbe:
     NODE_ID = "MyDLSSRuntimeProbe"
     DISPLAY_NAME = "My DLSS Runtime Probe"
     DESCRIPTION = (
-        "Runs one 32x32 deterministic RGB frame through the same DNR3 worker as "
+        "Runs one deterministic RGB frame (256x256 with NR, otherwise 32x32) "
+        "through the same DNR3 worker as "
         "My Video Enhance. At least DLAA/SR or neural rendering must be enabled. "
         "Missing user DLLs or Wine prefix files fail with the path that is missing."
     )
@@ -559,9 +560,11 @@ class MyDLSSRuntimeProbe:
         )
         if not plan.uses_dlss:
             raise ValueError("MyDLSSRuntimeProbe requires super resolution (DLAA/SR) or neural rendering")
+        # The NR runtime can stall on a 32x32 probe despite working at video sizes.
+        probe_size = 256 if plan.enable_neural_rendering else 32
         result = run_dlss_stage(
             plan,
-            probe_frame(),
+            probe_frame(probe_size, probe_size),
             runtime_dir=resolve_runtime_dir(str(runtime_dir)),
             wine_prefix=str(wine_prefix),
             channel_order="RGBA",

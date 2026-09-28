@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -118,6 +119,7 @@ class EnvironmentTests(unittest.TestCase):
         with self.assertRaises(RuntimeFileError) as raised:
             runtime.build_environment(files=self.files(SR_ONLY), base_env={})
         self.assertIn("DISPLAY", str(raised.exception))
+        self.assertIn("VirtualDisplay", str(raised.exception))
         with self.assertRaises(RuntimeFileError):
             runtime.build_environment(files=self.files(SR_ONLY), base_env={"DISPLAY": "   "})
 
@@ -351,6 +353,122 @@ class HostDriverTests(unittest.TestCase):
             env=DISPLAY_ENV,
         )
         self.assertNotIn("WINEPREFIX", driver.env)
+
+    def test_virtual_display_keeps_an_existing_display_without_a_process(self) -> None:
+        display = runtime.VirtualDisplay({"DISPLAY": " :7 ", "PATH": "/usr/bin"})
+        self.assertEqual(display.start(), {"DISPLAY": " :7 ", "PATH": "/usr/bin"})
+        self.assertFalse(display.owned)
+        display.close()
+        self.assertFalse(display.owned)
+
+    @unittest.skipUnless(shutil.which("Xvfb"), "requires Xvfb")
+    def test_virtual_display_starts_and_stops_a_private_xvfb(self) -> None:
+        display = runtime.VirtualDisplay({"PATH": "/usr/bin"})
+        try:
+            env = display.start()
+            number = int(env["DISPLAY"].removeprefix(":"))
+            self.assertGreaterEqual(number, runtime._VIRTUAL_DISPLAY_MIN)
+            self.assertLessEqual(number, runtime._VIRTUAL_DISPLAY_MAX)
+            self.assertTrue(display.owned)
+            self.assertIsNotNone(display._process)
+            assert display._process is not None
+            self.assertIsNone(display._process.poll())
+            self.assertTrue(Path(f"/tmp/.X11-unix/X{number}").exists())
+            # The cookie is private, and RANDR is disabled only on our server.
+            authority = Path(env["XAUTHORITY"])
+            self.assertEqual(authority.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(authority.parent.stat().st_mode & 0o777, 0o700)
+            self.assertIn("RANDR", display._process.args)
+            self.assertNotIn("-ac", display._process.args)
+        finally:
+            display.close()
+        self.assertFalse(display.owned)
+        self.assertIsNone(display._process)
+        self.assertFalse(Path(f"/tmp/.X11-unix/X{number}").exists())
+        self.assertFalse(authority.exists())
+        # Cleanup is idempotent after the owned server has exited.
+        display.close()
+
+    @unittest.skipUnless(shutil.which("Xvfb"), "requires Xvfb")
+    def test_concurrent_virtual_displays_do_not_share_or_stop_each_other(self) -> None:
+        first = runtime.VirtualDisplay({})
+        second = runtime.VirtualDisplay({})
+        try:
+            first_env = first.start()
+            second_env = second.start()
+            self.assertNotEqual(first_env["DISPLAY"], second_env["DISPLAY"])
+            first.close()
+            assert second._process is not None
+            self.assertIsNone(second._process.poll())
+            self.assertTrue(Path(f"/tmp/.X11-unix/X{second_env['DISPLAY'][1:]}").exists())
+        finally:
+            first.close()
+            second.close()
+
+    def test_virtual_display_names_a_missing_xvfb_without_starting_anything(self) -> None:
+        with mock.patch.object(runtime.shutil, "which", return_value=None):
+            display = runtime.VirtualDisplay({})
+            with self.assertRaises(RuntimeFileError) as raised:
+                display.start()
+        self.assertIn("Xvfb", str(raised.exception))
+        self.assertFalse(display.owned)
+        self.assertIsNone(display._process)
+
+    @unittest.skipUnless(shutil.which("Xvfb") and shutil.which("xdpyinfo"),
+                         "requires Xvfb and xdpyinfo")
+    def test_private_display_requires_its_cookie(self) -> None:
+        # Check access, not just file permissions: an unauthenticated client must fail.
+        display = runtime.VirtualDisplay({})
+        try:
+            env = {**os.environ, **display.start()}
+            good = subprocess.run(["xdpyinfo"], env=env, capture_output=True, timeout=5)
+            self.assertEqual(good.returncode, 0, good.stderr.decode(errors="replace"))
+            bad = subprocess.run(
+                ["xdpyinfo"], env={**env, "XAUTHORITY": str(self.root / "absent-auth")},
+                capture_output=True, timeout=5,
+            )
+            self.assertNotEqual(bad.returncode, 0)
+        finally:
+            display.close()
+
+    def test_spawn_failure_releases_reservation_and_authentication(self) -> None:
+        # Popen failures happen before readiness polling and must still release ownership.
+        lock = mock.Mock()
+        display = runtime.VirtualDisplay({})
+        with mock.patch.object(runtime.shutil, "which", return_value="/usr/bin/Xvfb"), \
+             mock.patch.object(runtime, "_reserve_display_number", return_value=(250, lock)), \
+             mock.patch.object(runtime.subprocess, "Popen", side_effect=OSError("spawn failed")):
+            with self.assertRaises(OSError):
+                display.start()
+        lock.close.assert_called()
+        self.assertIsNone(display._auth_directory)
+        self.assertIsNone(display._process)
+
+    def test_a_failed_xvfb_is_reaped_and_not_left_owned(self) -> None:
+        class _Exited:
+            def poll(self):
+                return 1
+
+            @property
+            def returncode(self):
+                return 1
+
+            def terminate(self):
+                raise AssertionError("an exited Xvfb must not be signalled again")
+
+            def wait(self, timeout=None):
+                del timeout
+                return 1
+
+        with mock.patch.object(runtime.shutil, "which", return_value="/usr/bin/Xvfb"), \
+             mock.patch.object(runtime.subprocess, "Popen", return_value=_Exited()), \
+             mock.patch.object(runtime, "_reserve_display_number", return_value=(250, mock.Mock())):
+            display = runtime.VirtualDisplay({})
+            with self.assertRaises(RuntimeFileError) as raised:
+                display.start()
+        self.assertIn("exited", str(raised.exception))
+        self.assertFalse(display.owned)
+        self.assertIsNone(display._process)
 
     def test_wine_driver_requires_a_host_file_and_display(self) -> None:
         runtime_dir = create_runtime_dir(self.root / "runtime", SR_ONLY)

@@ -188,45 +188,32 @@ cp "$PROTON_FILES/lib/wine/dxvk/x86_64-windows/dxgi.dll" "$PFX_SYS32/"
 
 ##### 3. 显示环境与无头服务器（Headless Server / Docker / 云 GPU）支持
 
-Wine 的 Direct3D 12 驱动在初始化交换链与离屏渲染上下文时，需要一个 X11 Display 协议端点。纯后台计算依然 100% 直通调用物理 NVIDIA 显卡，但需根据运行环境提供相应的 `DISPLAY`：
+Wine 的 Direct3D 12 驱动在初始化交换链与离屏渲染上下文时，需要一个 X11 Display 协议端点。纯后台计算依然直通调用物理 NVIDIA 显卡，显示端点不参与超分或神经渲染计算。
 
-- **桌面开发机 / 物理机（已有 Xorg 或桌面环境，但通过 systemd 后台服务启动）**：
-  直接在启动脚本（如 `run-comfyui`）中导出当前桌面的 Display：
-  ```bash
-  export DISPLAY="${DISPLAY:-:0}"
-  ```
+节点在启动真实 Wine DLSS 进程时自动处理该端点：
 
-- **纯无头服务器（Linux Server / 云端 GPU 如 AutoDL、RunPod / Docker 容器）**：
-  纯命令行系统没有物理显示器和桌面环境，推荐使用轻量级虚拟帧缓冲 **`Xvfb`**（不消耗真实显示资源，内存中模拟端点）：
-  1. 安装 `Xvfb`：
-     - Ubuntu / Debian: `apt-get update && apt-get install -y xvfb`
-     - Arch Linux: `pacman -S xorg-server-xvfb`
-  2. 后台启动虚拟显示服务：
-     ```bash
-     Xvfb :99 -screen 0 1024x768x24 -nolisten tcp &
-     export DISPLAY=:99
-     ```
+- 进程已有非空 `DISPLAY` 时，原样传给 Wine，节点不会启动或关闭它。
+- 没有 `DISPLAY` 时，节点为这一次 DLSS 执行启动一个私有 `Xvfb`（显示号 `:200`–`:299`，仅监听本机 Unix socket），并把该 `DISPLAY` 只传给 Wine 子进程。
+- 自动启动的 Xvfb 禁用 RANDR，避免零刷新率触发部分 DXVK `dxgi.dll` 的除零异常；不会修改已有桌面的扩展设置。
+- 私有显示使用随机 MIT-MAGIC-COOKIE-1 认证，认证目录权限为 `0700`、文件为 `0600`，只向 worker 传入 `XAUTHORITY`，执行后删除。不会关闭访问控制或监听 TCP。
+- Wine 进程正常退出、失败、超时或被中断后，节点立即关闭自己启动的 `Xvfb`。并发执行各自使用独立显示号，互不关闭。
+- 自定义 host / 测试 driver 不经过这条路径，也不会启动 `Xvfb`。
 
-- **推荐自适应启动脚本写法（桌面机与无头 Server 通用）**：
-  ```bash
-  if [ -z "${DISPLAY:-}" ]; then
-    if ! pgrep -x Xorg >/dev/null 2>&1 && command -v Xvfb >/dev/null 2>&1; then
-      # 纯无头环境：自动拉起 Xvfb 虚拟显示
-      Xvfb :99 -screen 0 1024x768x24 -nolisten tcp &
-      export DISPLAY=:99
-    else
-      # 本地桌面/服务环境：默认连接物理 :0
-      export DISPLAY=:0
-    fi
-  fi
-  ```
+因此桌面会话、systemd 服务和纯命令行机器使用同一套节点代码，不需要在启动脚本中导出 `DISPLAY`。无头环境只需预先安装 `Xvfb`，节点不会自行安装软件：
+
+- Ubuntu / Debian: `apt-get update && apt-get install -y xvfb`
+- Arch Linux: `pacman -S xorg-server-xvfb`
+
+`Xvfb` 主要消耗系统内存，帧缓冲和 X server 均有开销，实际 RSS 取决于配置；DLSS 的 GPU 开销另外计算。它只在缺少 `DISPLAY` 的那一次 DLSS 执行期间存在。正常完成、异常和可捕获取消会回收资源；宿主被强制 `SIGKILL` 或系统崩溃不保证执行 Python 清理。
 
 ##### 4. 硬件与驱动兼容性注意事项
 - **DLSS-SR（超分辨率 / DLAA 1.0x / 1.5x / 2.0x / 3.0x）**：
   - 支持 RTX 20/30/40 全系列 GPU。
   - 在 Linux + RTX 3090 + NVIDIA 驱动（已验证 610.57+）下已全面测试通过，运行稳定流畅。
 - **DLSS-NR（神经渲染 Feature 18）**：
-  - 属于 Linux/Wine 上的非官方实验性功能；RTX 3090 不在 NVIDIA 官方 DLSS 5 支持范围内。此前写的“Linux 驱动 ≥ 616.56”不成立：616.56 是 Windows 驱动版本，不能与 Linux 驱动号直接比较。当前尚未验证 Linux 615.71.09 上 Feature 18 可稳定完成推理，可能遇到 GPU fence 同步超时；生产使用请保持 `enable_neural_rendering: false`，仅在驱动内核模块与用户态版本一致后进行隔离的小尺寸探测。参见 [NVIDIA Linux 615.71.09 驱动](https://www.nvidia.com/en-us/drivers/details/278450/)与 [DLSS 5 官方支持范围](https://www.nvidia.com/en-us/geforce/news/dlss-5-3d-guided-neural-rendering/)。
+  - 属于 Linux/Wine 上的实验性路径，不保证跨运行库与驱动版本兼容。已在 RTX 3090 / Linux 615.71.09 / Wine 11.18 上验证 256×256 单帧及 1664×928 视频前两帧 NR 成功，尚不代表长视频稳定性验证。
+  - 同环境下 32×32 NR 探针会触发 GPU fence 超时，因此 Runtime Probe 启用 NR 时改用 256×256；SR-only 仍用 32×32。尚未确定 NR 的精确最小尺寸要求。
+  - Windows 与 Linux 驱动版本号不能直接比较；不要把 Windows 616.56 当作 Linux 驱动最低版本。
 - **插帧（VFI）**：
   - RTX 3090 硬件不支持 DLSS 3 Frame Generation（仅 RTX 40+ 支持）。本节点内置了基于 S-Lab GIMM-VFI 的纯离线高质量光流补帧，在独立阶段执行，不受 DLSS 硬件代际限制；默认顺序 `dlss_then_vfi` 下它跑在 Wine worker 退出之后，`vfi_then_dlss` 下跑在 worker 启动之前。
   - 权重位于 `models/interpolation/gimm-vfi/gimmvfi_r_arb_lpips_fp32.safetensors` 和 `raft-things_fp32.safetensors`。

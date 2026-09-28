@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import shutil
 import tempfile
 import types
 import unittest
@@ -23,6 +24,7 @@ import numpy as np
 from my_nodes.core.video_enhance import FEATURE_NR, FEATURE_SR
 from my_nodes.core.video_enhance.channel_order import select_channel_order, swap_rb
 from my_nodes.core.video_enhance.dlss_stage import (
+    DlssStageStream,
     SR_PRESET_IDS,
     FrameValidationError,
     apply_worker_environment,
@@ -543,6 +545,43 @@ class DlssStageIntegrationTests(unittest.TestCase):
                 )
         self.assertIn("cv2", str(raised.exception))
         self.assertEqual(started, [])
+
+    @unittest.skipUnless(shutil.which("Xvfb"), "requires Xvfb")
+    def test_builtin_driver_uses_a_private_display_and_releases_it(self) -> None:
+        # The built-in Wine path is the only path allowed to own an Xvfb. This
+        # exercises that ownership without a Wine prefix or a GPU worker.
+        plan = VideoEnhancePlan(enable_super_resolution=True, sr_scale=2.0)
+        observed = {}
+
+        def factory(**kwargs):
+            observed["env"] = kwargs["env"]
+            raise RuntimeError("stop after the display is attached")
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            stream = DlssStageStream(
+                plan,
+                [_frame()],
+                count=1,
+                height=6,
+                width=4,
+                runtime_dir="unused",
+                wine_prefix="",
+                channel_order="auto",
+                motion_mode=MOTION_NONE,
+                scene_cut_threshold=0.2,
+                driver_factory=None,
+            )
+            with mock.patch(
+                "my_nodes.core.video_enhance.dlss_stage.HostDriver.wine",
+                side_effect=factory,
+            ):
+                with self.assertRaises(RuntimeError):
+                    stream.__enter__()
+        number = int(observed["env"]["DISPLAY"].removeprefix(":"))
+        self.assertGreaterEqual(number, 200)
+        self.assertLessEqual(number, 299)
+        self.assertIsNone(stream._display)
+        self.assertFalse(Path(f"/tmp/.X11-unix/X{number}").exists())
 
     def test_runtime_dir_resolution_order(self) -> None:
         self.assertEqual(resolve_runtime_dir("  /explicit  ", env={}, models_dir="/models"), "/explicit")
@@ -1516,6 +1555,18 @@ class NodeContractTests(unittest.TestCase):
         self.assertEqual(dlss.call_args.kwargs["runtime_dir"], "/runtime")
         self.assertEqual(dlss.call_args.kwargs["motion_mode"], "none")
         self.assertEqual(dlss.call_args.args[1].shape, (1, 32, 32, 3))
+
+    def test_nr_probe_avoids_the_tiny_frame_gpu_timeout(self) -> None:
+        # NR must use a realistic probe size; SR keeps its inexpensive 32x32 input.
+        with mock.patch("my_nodes.nodes.video_enhance.run_dlss_stage") as dlss:
+            dlss.return_value = types.SimpleNamespace(
+                features=FEATURE_NR, output_width=256, output_height=256,
+                channel_order="RGBA",
+            )
+            MyDLSSRuntimeProbe().probe(False, "2.0x", True, "standard", 1.0,
+                                      runtime_dir="/runtime")
+        self.assertTrue(dlss.call_args.args[0].enable_neural_rendering)
+        self.assertEqual(dlss.call_args.args[1].shape, (1, 256, 256, 3))
 
     def test_the_advanced_controls_are_appended_after_the_legacy_widgets(self) -> None:
         optional = MyVideoEnhance.INPUT_TYPES()["optional"]

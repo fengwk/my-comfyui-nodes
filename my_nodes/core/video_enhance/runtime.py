@@ -9,13 +9,14 @@ Two things live here, both feature aware:
   other's file. The NVIDIA binaries stay user supplied: nothing here downloads
   or copies them.
 * `build_environment` / `HostDriver` describe how to start the vendored host
-  under Wine: DISPLAY is preserved (and its absence is an actionable error),
-  the Wine prefix is resolved and checked before launch (vkd3d-proton
-  `d3d12.dll` and dxvk-nvapi `nvapi64.dll` must already be installed; nothing
-  here creates or mutates a prefix), WINE can be overridden explicitly, the
-  DXVK/vkd3d/NVAPI variables the NGX core needs are set, an inherited
-  `LD_LIBRARY_PATH` is dropped, and the selected neural-rendering DLL name is
-  passed to the bridge. There is no Xvfb manager in this version.
+  under Wine: an existing DISPLAY is preserved, and its absence is resolved by
+  `VirtualDisplay`, which starts one private Xvfb for that launch and stops it
+  when the launch ends. The Wine prefix is resolved and checked before launch
+  (vkd3d-proton `d3d12.dll` and dxvk-nvapi `nvapi64.dll` must already be
+  installed; nothing here creates or mutates a prefix), WINE can be overridden
+  explicitly, the DXVK/vkd3d/NVAPI variables the NGX core needs are set, an
+  inherited `LD_LIBRARY_PATH` is dropped, and the selected neural-rendering DLL
+  name is passed to the bridge.
 """
 
 from __future__ import annotations
@@ -23,6 +24,11 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
+import socket
+import struct
+import subprocess
+import tempfile
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,6 +47,11 @@ HOST_EXE_NAME = "dlss5nr_host.exe"
 WINE_ENV_VAR = "DLSS5_WINE"
 WINEPREFIX_ENV_VAR = "DLSS5_WINEPREFIX"
 WINEHQ_STABLE_WINE = "/opt/wine-stable/bin/wine"
+# Private Xvfb range. A desktop session normally uses :0 or :1, and fixed
+# service displays such as :99 stay outside this range.
+_VIRTUAL_DISPLAY_MIN = 200
+_VIRTUAL_DISPLAY_MAX = 299
+_VIRTUAL_DISPLAY_READY_SECONDS = 5.0
 
 # Variables the NGX core needs under Wine. Existing values win, so a user can
 # still point at a different DXVK/vkd3d deployment.
@@ -268,13 +279,17 @@ def build_environment(
     wine_prefix: str | os.PathLike[str] | None = None,
     gpu_index: int = 0,
 ) -> dict[str, str]:
-    """Build the environment for the Wine host of this feature combination."""
+    """Build the environment for the Wine host of this feature combination.
+
+    `DISPLAY` is preserved when the caller already has one. It is not invented
+    here: a missing display is supplied by `VirtualDisplay` at process launch,
+    so this function stays free of processes and temporary files.
+    """
     env = _base_env(base_env)
     if not env.get("DISPLAY", "").strip():
         raise RuntimeFileError(
-            "DISPLAY is not set, and the DLSS host needs an X display for Wine's D3D12 "
-            "presentation. Start ComfyUI from a desktop session or set DISPLAY explicitly; "
-            "this version does not start an Xvfb server for you."
+            "DISPLAY is not set. The Wine launch must attach a VirtualDisplay "
+            "before building the host environment."
         )
     # A worker LD_LIBRARY_PATH (for example a CUDA toolkit) breaks the NVIDIA
     # shims on the Wine side.
@@ -299,6 +314,151 @@ def build_environment(
     elif WINEPREFIX_ENV_VAR in env and env.get(WINEPREFIX_ENV_VAR):
         env["WINEPREFIX"] = os.fspath(env[WINEPREFIX_ENV_VAR])
     return env
+
+
+class VirtualDisplay:
+    """One private Xvfb used only while a Wine DLSS launch has no DISPLAY.
+
+    An existing display is never replaced or stopped. A display created here is
+    stopped by `close`, including when Wine fails to start. Concurrent launches
+    receive different display numbers, so one launch cannot stop another's
+    server.
+    """
+
+    def __init__(self, env: Mapping[str, str]) -> None:
+        self.env = dict(env)
+        self._process: subprocess.Popen[bytes] | None = None
+        self._owned = False
+        self._auth_directory: tempfile.TemporaryDirectory | None = None
+
+    @property
+    def owned(self) -> bool:
+        """True when this object started the X server it publishes."""
+        return self._owned
+
+    def start(self) -> dict[str, str]:
+        """Return the launch environment, starting Xvfb only when necessary."""
+        if self.env.get("DISPLAY", "").strip():
+            return self.env
+        executable = shutil.which("Xvfb")
+        if executable is None:
+            raise RuntimeFileError(
+                "DISPLAY is not set and Xvfb was not found. Install Xvfb "
+                "(xorg-server-xvfb) so the DLSS host can initialize Wine's D3D12 "
+                "presentation; this code does not use a desktop session."
+            )
+        number, lock = _reserve_display_number()
+        try:
+            self._auth_directory = tempfile.TemporaryDirectory(prefix="dlss-xauth-")
+            authority = Path(self._auth_directory.name) / "Xauthority"
+            # Xauthority stores big-endian length-prefixed fields. FamilyLocal
+            # restricts this cookie to the host and the selected display.
+            fields = (socket.gethostname().encode(), str(number).encode(),
+                      b"MIT-MAGIC-COOKIE-1", os.urandom(16))
+            record = struct.pack(">H", 256)
+            record += b"".join(struct.pack(">H", len(field)) + field for field in fields)
+            with authority.open("xb") as auth_file:
+                os.chmod(authority, 0o600)
+                auth_file.write(record)
+            self._process = subprocess.Popen(
+                [
+                    executable,
+                    f":{number}",
+                    "-screen",
+                    "0",
+                    "1024x768x24",
+                    "-nolisten",
+                    "tcp",
+                    "-noreset",
+                    # Xvfb's zero-rate RandR modes trigger a divide by zero in
+                    # some DXVK DXGI builds. Wine's fallback modes avoid it.
+                    "-extension",
+                    "RANDR",
+                    "-auth",
+                    str(authority),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            self._owned = True
+            _wait_until_ready(self._process, number, lock)
+        except BaseException:
+            self.close()
+            raise
+        finally:
+            lock.close()
+        # Only the child needs this endpoint. Do not publish it to ComfyUI.
+        self.env["DISPLAY"] = f":{number}"
+        self.env["XAUTHORITY"] = str(authority)
+        return self.env
+
+    def close(self) -> None:
+        """Stop an Xvfb started by this object; idempotent and quiet."""
+        process, self._process = self._process, None
+        self._owned = False
+        if self._auth_directory is not None:
+            self._auth_directory.cleanup()
+            self._auth_directory = None
+        if process is None:
+            return
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
+        else:
+            process.wait(timeout=0)
+
+
+def _reserve_display_number() -> tuple[int, socket.socket]:
+    """Reserve one unused display and hold its lock socket until Xvfb binds it."""
+    for number in range(_VIRTUAL_DISPLAY_MIN, _VIRTUAL_DISPLAY_MAX + 1):
+        if Path(f"/tmp/.X{number}-lock").exists() or Path(f"/tmp/.X11-unix/X{number}").exists():
+            continue
+        lock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            lock.bind(f"\0dlss5-xvfb-{number}")
+        except OSError:
+            lock.close()
+            continue
+        return number, lock
+    raise RuntimeFileError(
+        f"no free X display in :{_VIRTUAL_DISPLAY_MIN}-:{_VIRTUAL_DISPLAY_MAX}; "
+        "close stale Xvfb processes before starting another DLSS host"
+    )
+
+
+def _wait_until_ready(process: subprocess.Popen[bytes], number: int, lock: socket.socket) -> None:
+    """Wait until the reserved display accepts connections, then release its lock."""
+    deadline = time.monotonic() + _VIRTUAL_DISPLAY_READY_SECONDS
+    ready = False
+    try:
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise RuntimeFileError(
+                    f"Xvfb exited with code {process.returncode} before display :{number} was ready"
+                )
+            if Path(f"/tmp/.X11-unix/X{number}").exists():
+                ready = True
+                return
+            time.sleep(0.02)
+    finally:
+        lock.close()
+        if not ready and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)
+    raise RuntimeFileError(f"Xvfb did not open display :{number} within {_VIRTUAL_DISPLAY_READY_SECONDS:.0f}s")
 
 
 @dataclass(frozen=True)

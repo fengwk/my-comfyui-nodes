@@ -32,7 +32,7 @@ from my_nodes.core.video_enhance.nr_profiles import (
     plan_neural_rendering_settings,
 )
 from my_nodes.core.video_enhance.plan import VideoEnhancePlan
-from my_nodes.core.video_enhance.runtime import FEATURE_NR, FEATURE_SR, HostDriver
+from my_nodes.core.video_enhance.runtime import FEATURE_NR, FEATURE_SR, HostDriver, VirtualDisplay
 
 RUNTIME_DIR_ENV = "DLSS5_RUNTIME_DIR"
 
@@ -302,6 +302,7 @@ class DlssStageStream:
         self._memory_hooks = memory_hooks
         self._guides: motion_guides.MotionGuides | None = None
         self._worker: Dnr3Worker | None = None
+        self._display: VirtualDisplay | None = None
 
     @property
     def header(self) -> dnr3.Header:
@@ -337,37 +338,58 @@ class DlssStageStream:
             empty_cache()
         factory = self._driver_factory if self._driver_factory is not None else HostDriver.wine
         prefix = self._wine_prefix.strip() or None
-        if self._driver_factory is None:
-            # The built-in driver takes the selected GPU, so its environment
-            # already names the adapter before the explicit overlay below.
-            driver = factory(
-                runtime_dir=self._runtime_dir,
-                features=self._header.features,
-                wine_prefix=prefix,
-                gpu_index=self._plan.gpu_index,
+        try:
+            if self._driver_factory is None:
+                # Wine needs an X endpoint before its D3D12 device exists. Keep a
+                # caller-supplied DISPLAY unchanged; otherwise this stage owns one
+                # Xvfb until the worker below has been reaped. Ownership is recorded
+                # before start(), so a failed launch is still closed below.
+                self._display = VirtualDisplay(os.environ)
+                launch_env = self._display.start()
+                # The built-in driver takes the selected GPU, so its environment
+                # already names the adapter before the explicit overlay below.
+                driver = factory(
+                    runtime_dir=self._runtime_dir,
+                    features=self._header.features,
+                    wine_prefix=prefix,
+                    gpu_index=self._plan.gpu_index,
+                    env=launch_env,
+                )
+            else:
+                # A test or custom host factory only knows the original keywords;
+                # its frozen driver is overlaid instead of being called differently.
+                driver = factory(
+                    runtime_dir=self._runtime_dir, features=self._header.features, wine_prefix=prefix
+                )
+            worker = Dnr3Worker(
+                self._header,
+                driver=apply_worker_environment(driver, self._plan, self._requested_channel_order),
+                timeout=self._timeout,
+                interrupt=self._interrupt,
             )
-        else:
-            # A test or custom host factory only knows the original keywords;
-            # its frozen driver is overlaid instead of being called differently.
-            driver = factory(
-                runtime_dir=self._runtime_dir, features=self._header.features, wine_prefix=prefix
-            )
-        worker = Dnr3Worker(
-            self._header,
-            driver=apply_worker_environment(driver, self._plan, self._requested_channel_order),
-            timeout=self._timeout,
-            interrupt=self._interrupt,
-        )
-        worker.__enter__()
+            worker.__enter__()
+        except BaseException:
+            self._close_display()
+            raise
         self._guides = guides
         self._worker = worker
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> bool:
         worker, self._worker = self._worker, None
-        if worker is None:
-            return False
-        return worker.__exit__(exc_type, exc, traceback)
+        try:
+            if worker is None:
+                return False
+            return worker.__exit__(exc_type, exc, traceback)
+        finally:
+            # Wine has either exited or been killed, so its presentation
+            # endpoint is no longer in use.
+            self._close_display()
+
+    def _close_display(self) -> None:
+        display, self._display = self._display, None
+        if display is not None:
+            display.close()
 
     def __iter__(self) -> Iterator[np.ndarray]:
         if self._worker is None or self._guides is None:
